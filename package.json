@@ -13,7 +13,8 @@
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "mongoose": "^8.0.3",
-    "socket.io": "^4.7.2"
+    "socket.io": "^4.7.2",
+    "uuid": "^8.3.2"  // 🚨 تم إضافة هذه الحزمة
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
