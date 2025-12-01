@@ -47,6 +47,15 @@ app.get('/', (req, res) => {
 // 6. ربط منطق Socket.io
 handleSocketConnections(io);
 
+app.get('/health', (req, res) => {
+    res.json({ status: "ok" });
+});
+
+// Test API
+app.get('/api/test', (req, res) => {
+    res.json({ message: "API works" });
+});
+
 // 7. تشغيل الخادم
 const PORT = process.env.PORT || 5000;
 
