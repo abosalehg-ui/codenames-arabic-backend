@@ -5,6 +5,7 @@ const { initializeGameBoard } = require('./gameSetup');
 const { makeAIGuess } = require('../utils/aiGuesser');
 
 const activeRooms = {}; 
+const disconnectedPlayers = {}; // { socketId: { roomCode, userId, disconnectedAt } }
 
 // دوال مساعدة
 const getRoom = (roomCode) => roomCode ? activeRooms[roomCode.toUpperCase()] : null;
@@ -117,11 +118,73 @@ const handleAITurn = (io, roomCode) => {
     }, 1000);
 };
 
+// دالة اختيار قائد جديد تلقائياً
+const autoAssignSpymaster = (room, team) => {
+    const guessersInTeam = room.players.filter(p => p.team === team && p.role === 'GUESSER' && p.isReady);
+    if (guessersInTeam.length > 0) {
+        const newSpymaster = guessersInTeam[0];
+        newSpymaster.role = 'SPYMASTER';
+        newSpymaster.isReady = false; // يحتاج إعادة تأكيد الجاهزية
+        return newSpymaster;
+    }
+    return null;
+};
+
 // الدالة الرئيسية لمعالجة اتصالات Socket.io
 const handleSocketConnections = (io) => {
     
     io.on('connection', (socket) => {
         console.log('New client connected:', socket.id);
+        
+        // AUTO-REJOIN: محاولة إعادة الاتصال التلقائي
+        socket.on('attemptRejoin', async (data) => {
+            try {
+                const { roomCode, userId } = data;
+                const room = getRoom(roomCode);
+                
+                if (!room) {
+                    socket.emit('rejoinFailed', 'الغرفة غير موجودة');
+                    return;
+                }
+                
+                // البحث عن اللاعب في قائمة المنفصلين
+                const disconnectedPlayer = room.players.find(p => p.userId === userId && p.disconnected);
+                
+                if (disconnectedPlayer) {
+                    // إعادة توصيل اللاعب
+                    disconnectedPlayer.id = socket.id;
+                    disconnectedPlayer.disconnected = false;
+                    delete disconnectedPlayer.disconnectedAt;
+                    
+                    socket.join(roomCode);
+                    socket.roomCode = roomCode;
+                    
+                    // إرسال حالة اللعبة الكاملة
+                    if (room.gameState === 'IN_PROGRESS') {
+                        socket.emit('gameRejoined', {
+                            room,
+                            board: room.board,
+                            currentTurn: room.currentTurn,
+                            clue: room.clue,
+                            guessesLeft: room.guessesLeft,
+                            players: room.players
+                        });
+                    } else {
+                        socket.emit('roomRejoined', room);
+                    }
+                    
+                    io.to(roomCode).emit('roomUpdate', room.players);
+                    io.to(roomCode).emit('playerReconnected', { username: disconnectedPlayer.username });
+                    
+                    console.log(`Player ${userId} rejoined room: ${roomCode}`);
+                } else {
+                    socket.emit('rejoinFailed', 'لم يتم العثور على بيانات اللاعب');
+                }
+            } catch (error) {
+                console.error('Error rejoining:', error);
+                socket.emit('rejoinFailed', 'فشل إعادة الاتصال');
+            }
+        });
         
         // CREATE ROOM
         socket.on('createRoom', async (data) => {
@@ -141,11 +204,14 @@ const handleSocketConnections = (io) => {
                         username: data.username || 'لاعب', 
                         team: null, 
                         role: null, 
-                        userId: data.userId 
+                        userId: data.userId,
+                        isReady: false,
+                        disconnected: false
                     }],
                     gameState: 'WAITING',
                     isAIGame: data.isAIGame || false,
-                    history: []
+                    history: [],
+                    lastActivity: Date.now()
                 };
                 socket.roomCode = roomCode;
                 
@@ -180,9 +246,12 @@ const handleSocketConnections = (io) => {
                     username: data.username || 'لاعب', 
                     team: null, 
                     role: null, 
-                    userId: data.userId 
+                    userId: data.userId,
+                    isReady: false,
+                    disconnected: false
                 });
                 socket.roomCode = roomCode; 
+                room.lastActivity = Date.now();
                 
                 io.to(roomCode).emit('roomUpdate', room.players);
                 
@@ -214,6 +283,8 @@ const handleSocketConnections = (io) => {
                 if (player) {
                     player.team = team;
                     player.role = role;
+                    player.isReady = false; // إلغاء الجاهزية عند تغيير الدور
+                    room.lastActivity = Date.now();
                     io.to(room.code).emit('roomUpdate', room.players);
                 }
             } catch (error) {
@@ -222,52 +293,43 @@ const handleSocketConnections = (io) => {
             }
         });
 
-        // START GAME
+        // SET READY (جديد)
+        socket.on('setReady', (data) => {
+            try {
+                const room = getRoom(socket.roomCode);
+                if (!room) return;
+
+                const player = getPlayer(room, socket.id);
+                if (!player || !player.team || !player.role) {
+                    socket.emit('readyError', 'يجب اختيار الفريق والدور أولاً');
+                    return;
+                }
+
+                player.isReady = data.isReady;
+                room.lastActivity = Date.now();
+                
+                io.to(room.code).emit('roomUpdate', room.players);
+                
+                // التحقق من جاهزية الجميع
+                const playersWithRoles = room.players.filter(p => p.team && p.role);
+                const allReady = playersWithRoles.length >= 4 && playersWithRoles.every(p => p.isReady);
+                
+                if (allReady) {
+                    // بدء اللعبة تلقائياً
+                    startGameAuto(io, room);
+                }
+            } catch (error) {
+                console.error('Error setting ready:', error);
+            }
+        });
+
+        // START GAME (محدث - للتوافق مع النظام القديم)
         socket.on('startGame', async () => {
             try {
                 const room = getRoom(socket.roomCode);
                 if (!room) return;
                 
-                const redSpymaster = room.players.some(p => p.team === 'RED' && p.role === 'SPYMASTER');
-                const blueSpymaster = room.players.some(p => p.team === 'BLUE' && p.role === 'SPYMASTER') || room.isAIGame;
-
-                if (!redSpymaster || !blueSpymaster) {
-                    socket.emit('gameError', 'يجب أن يكون هناك قائد أحمر وقائد أزرق لبدء اللعبة.');
-                    return;
-                }
-
-                const gameData = initializeGameBoard(); 
-                
-                const newGame = await Game.create({
-                    roomCode: room.code,
-                    board: gameData.board,
-                    currentTurn: gameData.currentTurn,
-                    firstTeam: gameData.firstTeam,
-                    players: room.players.map(p => ({
-                        socketId: p.id, 
-                        userId: p.userId, 
-                        username: p.username, 
-                        team: p.team, 
-                        role: p.role
-                    })),
-                    gameState: 'IN_PROGRESS',
-                });
-                
-                room.gameState = 'IN_PROGRESS';
-                room.currentGameId = newGame._id;
-                room.board = newGame.board;
-                room.currentTurn = newGame.currentTurn;
-
-                io.to(room.code).emit('gameStarted', {
-                    ...newGame.toObject(),
-                    players: room.players 
-                });
-                
-                console.log(`Game started in room: ${room.code}`);
-                
-                if (room.isAIGame && room.currentTurn === 'BLUE') {
-                    handleAITurn(io, room.code);
-                }
+                await startGameAuto(io, room);
             } catch (error) {
                 console.error('Error starting game:', error);
                 socket.emit('gameError', 'فشل بدء اللعبة.');
@@ -300,6 +362,7 @@ const handleSocketConnections = (io) => {
 
                 room.clue = clue;
                 room.guessesLeft = count + 1; 
+                room.lastActivity = Date.now();
 
                 let game = await Game.findById(room.currentGameId);
                 if (!game) return;
@@ -337,6 +400,7 @@ const handleSocketConnections = (io) => {
                 card.revealed = true;
                 card.pickedBy = player.team;
                 room.guessesLeft -= 1;
+                room.lastActivity = Date.now();
 
                 let result = card.type;
                 let turnOver = false;
@@ -402,6 +466,7 @@ const handleSocketConnections = (io) => {
                 room.currentTurn = nextTeam;
                 room.clue = null;
                 room.guessesLeft = 0; 
+                room.lastActivity = Date.now();
 
                 let game = await Game.findById(room.currentGameId);
                 if (!game) return;
@@ -434,15 +499,47 @@ const handleSocketConnections = (io) => {
                 const room = activeRooms[roomCode];
 
                 if (room) {
-                    room.players = room.players.filter(p => p.id !== socket.id);
+                    const player = getPlayer(room, socket.id);
                     
-                    if (room.players.length === 0) {
-                        delete activeRooms[roomCode];
-                        console.log(`Room ${roomCode} closed (empty).`);
-                    } else {
-                        io.to(roomCode).emit('roomUpdate', room.players);
-                        console.log(`Player ${socket.id} left room ${roomCode}`);
+                    if (player) {
+                        player.disconnected = true;
+                        player.disconnectedAt = Date.now();
+                        
+                        io.to(roomCode).emit('playerDisconnected', { 
+                            username: player.username,
+                            canRejoin: true 
+                        });
+                        
+                        // إذا كان قائد، نختار قائد جديد
+                        if (player.role === 'SPYMASTER' && room.gameState === 'IN_PROGRESS') {
+                            const newSpymaster = autoAssignSpymaster(room, player.team);
+                            if (newSpymaster) {
+                                io.to(roomCode).emit('newSpymasterAssigned', {
+                                    team: player.team,
+                                    username: newSpymaster.username
+                                });
+                                io.to(roomCode).emit('roomUpdate', room.players);
+                            }
+                        }
+                        
+                        // حذف اللاعب بعد 5 دقائق
+                        setTimeout(() => {
+                            const stillDisconnected = room.players.find(p => p.id === socket.id && p.disconnected);
+                            if (stillDisconnected) {
+                                room.players = room.players.filter(p => p.id !== socket.id);
+                                
+                                if (room.players.length === 0) {
+                                    delete activeRooms[roomCode];
+                                    console.log(`Room ${roomCode} closed (empty).`);
+                                } else {
+                                    io.to(roomCode).emit('roomUpdate', room.players);
+                                    io.to(roomCode).emit('playerLeft', { username: player.username });
+                                }
+                            }
+                        }, 5 * 60 * 1000); // 5 دقائق
                     }
+                    
+                    console.log(`Player ${socket.id} disconnected from room ${roomCode}`);
                 }
             } catch (error) {
                 console.error('Error on disconnect:', error);
@@ -450,5 +547,50 @@ const handleSocketConnections = (io) => {
         });
     });
 };
+
+// دالة مساعدة لبدء اللعبة تلقائياً
+async function startGameAuto(io, room) {
+    const redSpymaster = room.players.some(p => p.team === 'RED' && p.role === 'SPYMASTER');
+    const blueSpymaster = room.players.some(p => p.team === 'BLUE' && p.role === 'SPYMASTER') || room.isAIGame;
+
+    if (!redSpymaster || !blueSpymaster) {
+        io.to(room.code).emit('gameError', 'يجب أن يكون هناك قائد أحمر وقائد أزرق لبدء اللعبة.');
+        return;
+    }
+
+    const gameData = initializeGameBoard(); 
+    
+    const newGame = await Game.create({
+        roomCode: room.code,
+        board: gameData.board,
+        currentTurn: gameData.currentTurn,
+        firstTeam: gameData.firstTeam,
+        players: room.players.map(p => ({
+            socketId: p.id, 
+            userId: p.userId, 
+            username: p.username, 
+            team: p.team, 
+            role: p.role
+        })),
+        gameState: 'IN_PROGRESS',
+    });
+    
+    room.gameState = 'IN_PROGRESS';
+    room.currentGameId = newGame._id;
+    room.board = newGame.board;
+    room.currentTurn = newGame.currentTurn;
+    room.lastActivity = Date.now();
+
+    io.to(room.code).emit('gameStarted', {
+        ...newGame.toObject(),
+        players: room.players 
+    });
+    
+    console.log(`Game started in room: ${room.code}`);
+    
+    if (room.isAIGame && room.currentTurn === 'BLUE') {
+        handleAITurn(io, room.code);
+    }
+}
 
 module.exports = handleSocketConnections;
