@@ -335,4 +335,5 @@ const handleSocketConnections = (io) => {
         });
     });
 };
-module.exports = handleSocketConnections
+
+module.exports = handleSocketConnections;
