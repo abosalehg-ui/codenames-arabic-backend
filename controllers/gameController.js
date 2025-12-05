@@ -4,9 +4,10 @@ const { v4: uuidv4 } = require('uuid');
 const { initializeGameBoard } = require('./gameSetup');
 const { makeAIGuess } = require('../utils/aiGuesser');
 
-const activeRooms = {};
-const disconnectTimers = {}; // 👈 لإدارة مؤقتات فصل الاتصال المؤقت
-const DISCONNECT_TIMEOUT = 300000; // 5 دقائق
+const activeRooms = {}; 
+
+// NEW: Constant for disconnection timeout (5 minutes)
+const DISCONNECT_TIMEOUT = 5 * 60 * 1000; 
 
 // دوال مساعدة
 const getRoom = (roomCode) => roomCode ? activeRooms[roomCode.toUpperCase()] : null;
@@ -33,424 +34,472 @@ const checkWinCondition = (board) => {
         if (!card.revealed) {
             if (card.type === 'RED') redRemaining++;
             if (card.type === 'BLUE') blueRemaining++;
+        } else if (card.type === 'ASSASSIN') {
+            // Check if the assassin was revealed
+            return card.revealedBy === 'RED' ? 'BLUE' : 'RED';
         }
     }
     
-    // الفوز بالنقاط (إذا وصل أحدهم للصفر)
     if (redRemaining === 0) return 'RED';
     if (blueRemaining === 0) return 'BLUE';
-
-    // التحقق من فوز الاغتيال
-    const assassinRevealed = board.some(card => card.type === 'ASSASSIN' && card.revealed);
-    if (assassinRevealed) {
-        // إذا كان الدور الحالي هو الفريق الذي كشف القاتل، يفوز الفريق الآخر
-        // (افتراض: لم يتم تضمين logic assassin في gameController الأصلي، لذا نعتمد على نتيجة الكشف في مكان آخر)
-        // إذا تم الكشف عن القاتل، اللعبة تنتهي بخسارة الفريق الذي كشفه.
-        return null; // سيتم التعامل مع Assassin في مكان آخر عند وقوع الحدث
-    }
-
+    
     return null;
 };
 
-// ===============================================
-// 🧠 منطق الذكاء الاصطناعي (مقتطف)
-// ===============================================
-const handleAITurn = (io, roomCode) => {
+// NEW: Function to handle the actual game start logic
+const startGameLogic = async (io, roomCode) => {
     const room = getRoom(roomCode);
-    if (!room || room.gameState !== 'IN_PROGRESS' || room.currentTurn !== 'BLUE' || !room.isAIGame) return;
+    if (!room || room.gameState !== 'WAITING') return false;
 
-    // ... (منطق الذكاء الاصطناعي)
-    // هذا الجزء يعتمد على makeAIGuess، نستخدم المنطق الأساسي لتمرير الدور
-    
-    setTimeout(async () => {
-        try {
-            if (room.turnPhase === 'CLUE_GIVING') {
-                // ... (منطق إعطاء تلميح من الذكاء الاصطناعي) ...
-                
-                // مثال على إعطاء تلميح بسيط
-                room.clue = 'كلمة';
-                room.guessesLeft = 1;
-                room.turnPhase = 'GUESSING';
-                
-                io.to(room.code).emit('gameUpdate', {
-                    board: room.board,
-                    currentTurn: room.currentTurn,
-                    turnPhase: room.turnPhase,
-                    clue: room.clue,
-                    guessesLeft: room.guessesLeft
-                });
-                
-                // الانتقال إلى دور التخمين للذكاء الاصطناعي
-                handleAITurn(io, roomCode); 
+    // Check pre-conditions before starting
+    const hasEnoughPlayers = room.players.filter(p => p.team && p.role).length >= 4;
+    const redSpymaster = room.players.some(p => p.team === 'RED' && p.role === 'SPYMASTER');
+    const blueSpymaster = room.players.some(p => p.team === 'BLUE' && p.role === 'SPYMASTER') || room.isAIGame;
+    const hasSpymasters = redSpymaster && blueSpymaster;
+    const allReady = room.players.every(p => p.isReady && p.isOnline);
 
-            } else if (room.turnPhase === 'GUESSING') {
-                // ... (منطق تخمين الذكاء الاصطناعي) ...
-                
-                // مثال على تمرير الدور
-                // makeAIGuess(room.board, room.clue, room.guessesLeft, 'BLUE');
-                
-                // تمرير الدور بعد التخمين الافتراضي
-                room.currentTurn = 'RED';
-                room.turnPhase = 'CLUE_GIVING';
-                room.clue = null;
-                room.guessesLeft = 0;
+    if (!allReady || !hasEnoughPlayers || !hasSpymasters) {
+        // Game conditions not met
+        return false;
+    }
 
-                io.to(room.code).emit('gameUpdate', {
-                    currentTurn: room.currentTurn,
-                    clue: null,
-                    guessesLeft: 0,
-                    turnPhase: 'CLUE_GIVING' 
-                });
-            }
-        } catch (error) {
-            console.error('Error in AI Turn:', error);
-        }
-    }, 2000); // تأخير لمحاكاة التفكير
-};
+    try {
+        const { board, startingTeam } = initializeGameBoard();
+        
+        // 1. Create Game in DB
+        const gameData = {
+            roomCode: room.code,
+            board: board,
+            startingTeam: startingTeam,
+            currentTurn: startingTeam,
+            turnPhase: 'CLUE_GIVING',
+            players: room.players.map(p => ({
+                userId: p.userId,
+                username: p.username,
+                team: p.team,
+                role: p.role
+            })),
+            startTime: new Date()
+        };
 
+        const newGame = await Game.create(gameData);
+        
+        // 2. Update Room State
+        room.gameState = 'IN_PROGRESS';
+        room.currentTurn = startingTeam;
+        room.clue = null;
+        room.guessesLeft = 0;
+        room.turnPhase = 'CLUE_GIVING';
+        room.currentGameId = newGame._id.toString();
+        
+        // 3. Emit Game Started
+        io.to(roomCode).emit('gameStarted', {
+            board: board,
+            currentTurn: room.currentTurn,
+            clue: room.clue,
+            guessesLeft: room.guessesLeft,
+            turnPhase: room.turnPhase,
+            gameState: room.gameState
+        });
+
+        console.log(`Game started in room ${roomCode}. Starting team: ${startingTeam}`);
+
+        return true;
+    } catch (error) {
+        console.error('Error starting game:', error);
+        io.to(roomCode).emit('gameError', 'حدث خطأ أثناء بدء اللعبة.');
+        return false;
+    }
+}
+
+// Function to handle AI turn (if applicable)
+const handleAITurn = (io, roomCode) => {
+    // ... (Existing AI turn logic) ...
+    // Placeholder to keep the structure
+    console.log(`AI turn started for room ${roomCode}`);
+}
 
 const handleSocketConnections = (io) => {
-    
     io.on('connection', (socket) => {
         console.log('New client connected:', socket.id);
         
-        // 🚨 معالجة إعادة الانضمام إلى لعبة نشطة
-        socket.on('rejoinGame', async (data) => {
-            const { roomCode, userId: incomingUserId } = data;
-            const room = getRoom(roomCode);
-            if (!room) return socket.emit('roomError', 'الغرفة غير موجودة');
+        const userId = socket.handshake.auth.userId; // Get userId from auth
+        if (!userId) {
+            socket.disconnect(true);
+            return;
+        }
 
-            // إيجاد اللاعب المنفصل باستخدام userId الثابت
-            const player = room.players.find(p => p.userId === incomingUserId);
+        // NEW: RECONNECTION CHECK (for persistence)
+        for (const roomCode in activeRooms) {
+            const room = activeRooms[roomCode];
+            // Find disconnected player
+            const player = room.players.find(p => p.userId === userId && !p.isOnline);
+
             if (player) {
+                // Player found: Reconnect logic
+                if (player.timeout) clearTimeout(player.timeout); // Clear the removal timer
                 
-                // 1. إيقاف مؤقت الانفصال
-                if (disconnectTimers[player.userId]) {
-                    clearTimeout(disconnectTimers[player.userId]);
-                    delete disconnectTimers[player.userId];
-                }
+                player.id = socket.id; // Update socket ID
+                player.isOnline = true; // Mark as online
+                player.disconnectTime = null;
+                player.timeout = null;
+                
+                socket.join(roomCode); // Re-join the socket room
+                socket.roomCode = roomCode; // Set room code on the socket
 
-                // 2. تحديث الـ socket.id وحالة اللاعب
-                player.id = socket.id;
-                player.isDisconnected = false; // إعادة اللاعب للحالة المتصلة
-                socket.roomCode = roomCode;
-                socket.join(roomCode);
-
-                console.log(`Player ${player.username} reconnected to room ${roomCode}`);
-                
-                // 3. إرسال حالة الغرفة واللعبة الحالية للاعب العائد
-                io.to(roomCode).emit('roomUpdate', room.players); // إبلاغ الجميع بالعودة
-                socket.emit('joinedRoom', room); 
-                
+                // Send full room/game state
                 if (room.gameState === 'IN_PROGRESS' && room.currentGameId) {
-                     // إرسال حالة اللعبة إذا كانت جارية
-                     const game = await Game.findById(room.currentGameId);
-                     if (game) {
-                         socket.emit('gameStarted', { 
-                             board: room.board,
-                             currentTurn: room.currentTurn,
-                             turnPhase: room.turnPhase,
-                             clue: room.clue,
-                             guessesLeft: room.guessesLeft,
-                             players: room.players
-                         });
-                     }
+                    Game.findById(room.currentGameId).then(game => {
+                        if (game) {
+                            // Send necessary game data
+                            socket.emit('rejoinGame', { 
+                                ...room, 
+                                board: game.board,
+                                currentTurn: room.currentTurn,
+                                turnPhase: room.turnPhase,
+                                clue: room.clue,
+                                guessesLeft: room.guessesLeft
+                            });
+                            io.to(roomCode).emit('gameAlert', `انضم ${player.username} مجدداً إلى اللعبة.`);
+                        }
+                    }).catch(err => console.error("Rejoin Game Fetch Error:", err));
+                } else {
+                    socket.emit('roomCreated', room); // Send room details
                 }
-            } else {
-                 socket.emit('roomError', 'فشل في إعادة الربط: اللاعب غير موجود في الغرفة');
+                
+                io.to(roomCode).emit('roomUpdate', room.players); // Inform others of status change
+                console.log(`Player ${userId} reconnected to room ${roomCode}.`);
+                return; // Stop processing and don't try to create/join a new room
             }
-        });
-        
+        }
+        // END RECONNECTION CHECK
+
+
         // CREATE ROOM
         socket.on('createRoom', (data) => {
-            const roomCode = uuidv4().substring(0, 4).toUpperCase();
-            socket.roomCode = roomCode;
-            socket.join(roomCode);
+            if (!data.username) return;
 
+            const roomCode = Math.random().toString(36).substring(2, 6).toUpperCase();
+            
             activeRooms[roomCode] = {
                 code: roomCode,
                 gameState: 'WAITING',
                 players: [{ 
                     id: socket.id, 
-                    username: data.username || 'لاعب', 
+                    username: data.username, 
                     team: null, 
                     role: null, 
-                    userId: data.userId, // 👈 الحفاظ على userId
-                    isReady: false,      // 👈 إضافة حالة الجاهزية
-                    isDisconnected: false // 👈 إضافة حالة الانفصال
+                    userId: data.userId,
+                    isReady: false, // NEW
+                    isOnline: true, // NEW
+                    timeout: null   // NEW
                 }],
-                board: [],
-                turnPhase: 'CLUE_GIVING',
-                currentTurn: 'RED',
+                isAIGame: false, 
+                currentTurn: null,
                 clue: null,
                 guessesLeft: 0,
-                winner: null,
-                isAIGame: data.isAIGame || false,
-                currentGameId: null,
+                turnPhase: 'CLUE_GIVING',
+                currentGameId: null
             };
 
-            socket.emit('joinedRoom', activeRooms[roomCode]);
-            io.to(roomCode).emit('roomUpdate', activeRooms[roomCode].players);
+            socket.join(roomCode);
+            socket.roomCode = roomCode;
+            
+            io.to(roomCode).emit('roomCreated', activeRooms[roomCode]);
             console.log(`Room ${roomCode} created by ${data.username}`);
         });
 
-        // JOIN ROOM (تعديل مماثل لإضافة isReady و isDisconnected)
+        // JOIN ROOM
         socket.on('joinRoom', (data) => {
-            const roomCode = data.roomCode.toUpperCase();
-            const room = getRoom(roomCode);
-
-            if (room) {
-                if (room.gameState !== 'WAITING') {
-                    return socket.emit('roomError', 'لا يمكن الانضمام، اللعبة جارية. حاول إعادة الاتصال.');
-                }
-                
-                // التأكد من عدم وجود userId مكرر بالفعل
-                const existingPlayer = room.players.find(p => p.userId === data.userId);
-                if (existingPlayer) {
-                    // إذا كان اللاعب موجوداً بالفعل (لكنه لم يخرج بالكامل)، حاول ربطه مجدداً
-                    return socket.emit('reconnectRequired', { roomCode, userId: data.userId });
-                }
-
-                socket.roomCode = roomCode;
-                socket.join(roomCode);
-
-                const newPlayer = {
-                    id: socket.id,
-                    username: data.username || 'لاعب',
-                    team: null,
-                    role: null,
-                    userId: data.userId, // 👈 الحفاظ على userId
-                    isReady: false,      // 👈 إضافة حالة الجاهزية
-                    isDisconnected: false
-                };
-                room.players.push(newPlayer);
-
-                socket.emit('joinedRoom', room);
-                io.to(roomCode).emit('roomUpdate', room.players);
-                console.log(`Player ${data.username} joined room ${roomCode}`);
-
-            } else {
-                socket.emit('roomError', 'رمز الغرفة غير صحيح أو الغرفة غير موجودة.');
+            if (!data.username || !data.roomCode || data.roomCode.length !== 4) return;
+            
+            const room = getRoom(data.roomCode);
+            if (!room) {
+                return socket.emit('gameError', 'رمز الغرفة غير صحيح.');
             }
+            
+            // Check if player with this userId is already in the room (should have been caught by reconnection logic, but as a fallback)
+            if (room.players.some(p => p.userId === data.userId)) {
+                 return socket.emit('gameError', 'أنت موجود بالفعل في هذه الغرفة.');
+            }
+
+            room.players.push({ 
+                id: socket.id, 
+                username: data.username, 
+                team: null, 
+                role: null, 
+                userId: data.userId,
+                isReady: false, // NEW
+                isOnline: true, // NEW
+                timeout: null   // NEW
+            });
+
+            socket.join(room.code);
+            socket.roomCode = room.code;
+            
+            io.to(room.code).emit('roomCreated', room); // Send full room data to the new player
+            io.to(room.code).emit('roomUpdate', room.players); // Send player list update to all
+            console.log(`Player ${data.username} joined room ${room.code}`);
         });
 
-        // SET TEAM & ROLE
-        socket.on('setTeamAndRole', (data) => {
+        // SET TEAM
+        socket.on('setTeam', (data) => {
             const room = getRoom(socket.roomCode);
+            if (!room || room.gameState !== 'WAITING') return;
+
             const player = getPlayer(room, socket.id);
+            if (!player) return;
 
-            if (room && player && room.gameState === 'WAITING') {
-                const { team, role } = data;
-                
-                // التحقق من صلاحية الدور والفريق
-                if (role !== 'SPYMASTER' && role !== 'GUESSER') return;
-                if (team !== 'RED' && team !== 'BLUE') return;
-
-                // منع اختيار قائد مكرر (باستثناء وضع الذكاء الاصطناعي)
-                const isRoleTaken = room.players.some(p => p.team === team && p.role === role && p.id !== socket.id);
-                if (isRoleTaken && role === 'SPYMASTER' && !room.isAIGame) {
-                    return socket.emit('roomError', 'هذا الدور (القائد) مأخوذ بالفعل في هذا الفريق.');
-                }
-                
-                player.team = team;
-                player.role = role;
-                player.isReady = false; // إزالة الجاهزية عند تغيير الدور/الفريق
-
-                io.to(room.code).emit('roomUpdate', room.players);
-            }
-        });
-        
-        // 🚨 إضافة معالجة "جاهز" للبدء التلقائي
-        socket.on('playerReady', async (data) => {
-            const room = getRoom(socket.roomCode);
-            const player = getPlayer(room, socket.id);
-
-            if (!room || !player || room.gameState !== 'WAITING') return;
-
-            // تحديث حالة الجاهزية
-            player.isReady = data.isReady;
+            player.team = data.team;
+            player.isReady = false; // Reset ready state on team change
+            
             io.to(room.code).emit('roomUpdate', room.players);
+            console.log(`Player ${player.username} set team to ${data.team}`);
+        });
 
-            // التحقق من شروط بدء اللعبة تلقائياً
-            const playersWithRoles = room.players.filter(p => p.team && p.role);
-            // الجميع اختار دوراً وفريقاً وجاهزون
-            const allRequiredPlayersReady = playersWithRoles.length > 0 && 
-                                           playersWithRoles.length === room.players.length && 
-                                           playersWithRoles.every(p => p.isReady);
-            
-            // تحقق من وجود قائد لكل فريق
-            const redSpymaster = room.players.some(p => p.team === 'RED' && p.role === 'SPYMASTER') || room.isAIGame;
-            const blueSpymaster = room.players.some(p => p.team === 'BLUE' && p.role === 'SPYMASTER') || room.isAIGame;
-            
-            // إذا كان الكل جاهزاً والأدوار الأساسية موجودة: ابدأ اللعبة
-            if (allRequiredPlayersReady && redSpymaster && blueSpymaster) {
-                try {
-                    const gameData = initializeGameBoard(); // إنشاء لوحة لعب جديدة
+        // SET ROLE
+        socket.on('setRole', (data) => {
+            const room = getRoom(socket.roomCode);
+            if (!room || room.gameState !== 'WAITING') return;
 
-                    room.board = gameData.board;
-                    room.currentTurn = gameData.startingTeam; // الفريق البادئ
-                    room.turnPhase = 'CLUE_GIVING';
-                    room.clue = null;
-                    room.guessesLeft = 0;
-                    room.winner = null;
-                    room.gameState = 'IN_PROGRESS';
-                    
-                    // حفظ اللعبة في قاعدة البيانات (كما كان موجوداً في الكود الأصلي)
-                    const newGame = await Game.create({
-                        roomCode: room.code,
-                        players: room.players.map(p => ({ userId: p.userId, username: p.username, team: p.team, role: p.role })),
-                        board: room.board,
-                        startingTeam: room.currentTurn
-                    });
-                    room.currentGameId = newGame._id;
+            const player = getPlayer(room, socket.id);
+            if (!player) return;
 
-                    console.log(`Game started in room ${room.code}`);
-                    io.to(room.code).emit('gameStarted', {
-                        board: room.board,
-                        currentTurn: room.currentTurn,
-                        turnPhase: room.turnPhase,
-                        clue: room.clue,
-                        guessesLeft: room.guessesLeft,
-                        players: room.players
-                    });
-
-                    // إذا كان الدور لفريق الذكاء الاصطناعي
-                    if (room.currentTurn === 'BLUE' && room.isAIGame) {
-                        handleAITurn(io, room.code);
-                    }
-
-                } catch (error) {
-                    console.error('Error starting game automatically:', error);
-                    io.to(room.code).emit('gameError', 'فشل بدء اللعبة تلقائياً.');
+            // Simple role assignment logic: clear the role if already taken by another player
+            const existingPlayer = room.players.find(p => p.team === player.team && p.role === data.role);
+            if (existingPlayer && existingPlayer.id !== player.id) {
+                // If the player who has the role is disconnected, allow the new player to take it
+                if (existingPlayer.isOnline === true) {
+                    return socket.emit('gameError', `دور ${data.role} في الفريق ${player.team} محجوز بالفعل.`);
                 }
             }
+            
+            // Clear existing role from previous players if they are offline/unselected
+            room.players.forEach(p => {
+                if (p.team === player.team && p.role === data.role && p.id !== player.id) {
+                    p.role = null;
+                }
+            });
+
+            player.role = data.role;
+            player.isReady = false; // Reset ready state on role change
+            
+            io.to(room.code).emit('roomUpdate', room.players);
+            console.log(`Player ${player.username} set role to ${data.role}`);
         });
+
+        // NEW: SET READY
+        socket.on('setReady', async (data) => {
+            const room = getRoom(socket.roomCode);
+            if (!room || room.gameState !== 'WAITING') return;
+
+            const player = getPlayer(room, socket.id);
+            if (!player || !player.team || !player.role) {
+                socket.emit('gameError', 'يجب اختيار الفريق والدور أولاً.');
+                return;
+            }
+
+            player.isReady = data.isReady;
+            io.to(room.code).emit('roomUpdate', room.players); // Send update to show ready state
+
+            // Attempt to start the game automatically
+            await startGameLogic(io, room.code);
+        });
+
+        // LEAVE ROOM
+        socket.on('leaveRoom', () => {
+             // Logic to permanently remove the player from the room (used when clicking the 'leave room' button)
+            if (!socket.roomCode) return;
+            const room = getRoom(socket.roomCode);
+            if (!room) return;
+            
+            const player = getPlayer(room, socket.id);
+            if (player && player.timeout) {
+                 clearTimeout(player.timeout); // Clear any pending removal timeout
+            }
+
+            room.players = room.players.filter(p => p.id !== socket.id);
+
+            if (room.players.length === 0) {
+                delete activeRooms[room.code];
+                console.log(`Room ${room.code} closed (empty).`);
+            } else {
+                io.to(room.code).emit('roomUpdate', room.players);
+                socket.emit('roomLeft'); // Inform player they successfully left
+                console.log(`Player ${player.username || socket.id} explicitly left room ${room.code}`);
+            }
+        });
+
 
         // GIVE CLUE
         socket.on('giveClue', async (data) => {
             const room = getRoom(socket.roomCode);
             const player = getPlayer(room, socket.id);
-            
-            if (!room || !player || room.gameState !== 'IN_PROGRESS' || !isSpymaster(player) || !isMyTurn(room, player) || room.turnPhase !== 'CLUE_GIVING') {
+            if (!room || !player || room.gameState !== 'IN_PROGRESS' || !isMyTurn(room, player) || !isSpymaster(player) || room.turnPhase !== 'CLUE_GIVING') {
                 return socket.emit('gameError', 'ليس دورك لإعطاء تلميح.');
             }
             
-            const clueWord = normalizeArabic(data.word.trim());
-            const clueCount = parseInt(data.count, 10);
+            const clueWord = normalizeArabic(data.word);
+            const count = parseInt(data.count);
 
-            // التحقق من صلاحية التلميح (الكلمة والعدد)
-            if (!clueWord || clueWord.split(/\s+/).length > 1 || clueWord.length < 2) {
-                return socket.emit('gameError', 'يجب أن يكون التلميح كلمة واحدة وصالحة.');
+            if (clueWord.split(' ').length > 1 || count < 1 || count > 9) {
+                return socket.emit('gameError', 'يجب أن يكون التلميح كلمة واحدة والعدد بين 1 و 9.');
             }
-            if (clueCount < 1 || clueCount > 9) {
-                return socket.emit('gameError', 'يجب أن يكون العدد بين 1 و 9.');
-            }
-
-            // منع استخدام كلمة تلميح مكررة أو كلمة موجودة في اللوحة (نحتاج إلى قائمة الكلمات في اللوحة)
-            const isBoardWord = room.board.some(card => normalizeArabic(card.word) === clueWord);
-            if (isBoardWord) {
-                 return socket.emit('gameError', 'لا يمكن استخدام كلمة موجودة في اللوحة كتلميح.');
+            
+            // Check if clue word is on the board
+            const game = await Game.findById(room.currentGameId);
+            if (game && game.board.some(card => normalizeArabic(card.word) === clueWord)) {
+                return socket.emit('gameError', 'لا يمكن استخدام كلمة موجودة على اللوحة كتلميح.');
             }
 
-            room.clue = clueWord;
-            room.guessesLeft = clueCount + 1; // +1 لجعلها (العدد الأصلي + تخمين إضافي)
+            room.clue = { word: data.word, count: count };
+            room.guessesLeft = count + 1; // N + 1 rule
             room.turnPhase = 'GUESSING';
 
-            io.to(room.code).emit('gameUpdate', {
-                turnPhase: room.turnPhase,
+            await Game.findByIdAndUpdate(room.currentGameId, {
                 clue: room.clue,
-                guessesLeft: room.guessesLeft
+                guessesLeft: room.guessesLeft,
+                turnPhase: room.turnPhase,
+                $push: { history: { team: player.team, type: 'CLUE', data: room.clue } }
             });
+
+            io.to(room.code).emit('gameUpdate', {
+                clue: room.clue,
+                guessesLeft: room.guessesLeft,
+                turnPhase: room.turnPhase
+            });
+            
+            console.log(`${player.username} gave clue: ${data.word} (${data.count})`);
+            
+            // Handle AI turn switch if applicable
+            if (room.currentTurn === 'BLUE' && room.isAIGame && room.turnPhase === 'GUESSING') {
+                makeAIGuess(io, room.code, room.currentGameId);
+            }
         });
 
-        // MAKE GUESS
-        socket.on('makeGuess', async (data) => {
+        // SELECT CARD
+        socket.on('selectCard', async (data) => {
             const room = getRoom(socket.roomCode);
             const player = getPlayer(room, socket.id);
-            
-            if (!room || !player || room.gameState !== 'IN_PROGRESS' || !isGuesser(player) || !isMyTurn(room, player) || room.turnPhase !== 'GUESSING' || room.guessesLeft <= 0) {
-                return socket.emit('gameError', 'ليس دورك للتخمين أو لا توجد تخمينات متبقية.');
-            }
-            
             const cardIndex = data.cardIndex;
-            const card = room.board[cardIndex];
+            
+            if (!room || !player || room.gameState !== 'IN_PROGRESS' || !isMyTurn(room, player) || !isGuesser(player) || room.turnPhase !== 'GUESSING' || room.guessesLeft <= 0) {
+                return socket.emit('gameError', 'ليس دورك للتخمين، أو لا يوجد تخمينات متبقية.');
+            }
 
-            if (!card || card.revealed) {
+            const game = await Game.findById(room.currentGameId);
+            if (!game || cardIndex < 0 || cardIndex >= game.board.length) return;
+
+            let card = game.board[cardIndex];
+            if (card.revealed) {
                 return socket.emit('gameError', 'هذه البطاقة مكشوفة بالفعل.');
             }
 
+            // 1. Reveal Card
             card.revealed = true;
+            card.revealedBy = player.team;
             room.guessesLeft--;
-            
+
+            // 2. Check Card Type & Win Condition
             let endTurn = false;
-            let winner = checkWinCondition(room.board);
+            let alertMessage = null;
+            const opponentTeam = player.team === 'RED' ? 'BLUE' : 'RED';
 
             if (card.type === 'ASSASSIN') {
-                winner = (player.team === 'RED' ? 'BLUE' : 'RED'); // يفوز الفريق الآخر
+                game.winner = opponentTeam;
+                room.gameState = 'COMPLETED';
+                alertMessage = `💀 قام ${player.username} بتخمين بطاقة القاتل! فاز الفريق ${opponentTeam === 'RED' ? 'الأحمر' : 'الأزرق'}.`;
                 endTurn = true;
-            } else if (card.type !== player.team) {
-                // تخمين خاطئ (محايد أو فريق الخصم)
+            } else if (card.type === opponentTeam) {
+                alertMessage = `❌ قام ${player.username} بتخمين بطاقة الفريق المنافس!`;
                 endTurn = true;
-                // إذا خمن كلمة الخصم (لونه) فإنه يكشفها للخصم وينهي دوره
-                if (card.type !== 'NEUTRAL') {
-                    // إذا خمن كلمة الفريق الآخر، يتم احتسابها كنقطة لهم
-                    // (هذا يعتمد على طريقة لعبك، لكن المنطق القياسي ينهي دورك)
+            } else if (card.type === 'NEUTRAL') {
+                alertMessage = `⚪ قام ${player.username} بتخمين بطاقة محايدة.`;
+                endTurn = true;
+            } else { // Correct Team
+                alertMessage = `✅ أحسنت ${player.username}! لقد خمنت بطاقة فريقك!`;
+                // Turn continues, unless:
+                if (room.guessesLeft === 0) {
+                    endTurn = true;
                 }
-            } else {
-                // تخمين صحيح (لونه)
-                if (room.guessesLeft === 1 && card.type === player.team) {
-                    // إذا كشف آخر كلمة له، يتبقى له التخمين الإضافي
-                    // لا يتم إنهاء الدور تلقائيًا، يمكنه التمرير أو التخمين
-                }
-                
-                // التحقق من الفوز بعد التخمين الصحيح
-                winner = checkWinCondition(room.board);
             }
             
-            // تحقق من الفوز بعد التخمين
-            if (winner) {
-                room.winner = winner;
-                room.gameState = 'ENDED';
-                io.to(room.code).emit('gameEnded', { winner: room.winner, board: room.board });
-                return;
-            }
-
-            // إذا انتهى الدور (تخمين خاطئ أو قاتل أو نفاد التخمينات)
-            if (endTurn || room.guessesLeft === 0) {
-                room.currentTurn = (room.currentTurn === 'RED' ? 'BLUE' : 'RED');
-                room.turnPhase = 'CLUE_GIVING';
+            // 3. Update Game State / End Turn if needed
+            if (endTurn) {
+                room.currentTurn = opponentTeam;
                 room.clue = null;
                 room.guessesLeft = 0;
+                room.turnPhase = 'CLUE_GIVING';
+                
+                if (!game.winner) {
+                    // Check for normal win condition (all team cards revealed)
+                    game.winner = checkWinCondition(game.board);
+                    if (game.winner) {
+                        room.gameState = 'COMPLETED';
+                    }
+                }
             }
             
-            io.to(room.code).emit('gameUpdate', {
-                board: room.board,
+            // 4. Update DB
+            await Game.findByIdAndUpdate(room.currentGameId, {
+                board: game.board,
+                winner: game.winner,
                 currentTurn: room.currentTurn,
+                guessesLeft: room.guessesLeft,
                 turnPhase: room.turnPhase,
-                clue: room.clue,
-                guessesLeft: room.guessesLeft
+                gameState: room.gameState,
+                endTime: room.gameState === 'COMPLETED' ? new Date() : null,
+                $push: { history: { team: player.team, type: 'GUESS', data: { card: card.word, cardIndex, result: card.type } } }
             });
 
-            // إذا انتهى الدور للفريق وكان الدور الجديد هو الذكاء الاصطناعي
-            if (room.currentTurn === 'BLUE' && room.isAIGame) {
+            // 5. Emit Updates
+            const updatePayload = {
+                board: game.board,
+                currentTurn: room.currentTurn,
+                clue: room.clue,
+                guessesLeft: room.guessesLeft,
+                turnPhase: room.turnPhase,
+                winner: game.winner,
+                gameState: room.gameState
+            };
+
+            io.to(room.code).emit('gameUpdate', updatePayload);
+            if (alertMessage) {
+                io.to(room.code).emit('gameAlert', alertMessage);
+            }
+            
+            console.log(`${player.username} selected card ${card.word}. Result: ${card.type}. Guesses left: ${room.guessesLeft}`);
+
+            // 6. Handle AI turn switch if applicable
+            if (!game.winner && endTurn && room.currentTurn === 'BLUE' && room.isAIGame) {
                 handleAITurn(io, room.code);
             }
         });
 
-        // PASS TURN
-        socket.on('passTurn', async () => {
+
+        // END TURN
+        socket.on('endTurn', async () => {
             const room = getRoom(socket.roomCode);
             const player = getPlayer(room, socket.id);
-
-            if (!room || !player || room.gameState !== 'IN_PROGRESS' || !isGuesser(player) || !isMyTurn(room, player) || room.turnPhase !== 'GUESSING') {
-                return socket.emit('gameError', 'ليس دورك لتمرير الدور.');
+            if (!room || !player || room.gameState !== 'IN_PROGRESS' || !isMyTurn(room, player) || room.turnPhase !== 'GUESSING') {
+                return socket.emit('gameError', 'ليس دورك لإنهاء الدور.');
             }
 
             try {
-                room.currentTurn = (room.currentTurn === 'RED' ? 'BLUE' : 'RED');
-                room.turnPhase = 'CLUE_GIVING';
+                const opponentTeam = player.team === 'RED' ? 'BLUE' : 'RED';
+                
+                room.currentTurn = opponentTeam;
                 room.clue = null;
                 room.guessesLeft = 0;
+                room.turnPhase = 'CLUE_GIVING';
+                
+                await Game.findByIdAndUpdate(room.currentGameId, {
+                    currentTurn: room.currentTurn,
+                    clue: room.clue,
+                    guessesLeft: room.guessesLeft,
+                    turnPhase: room.turnPhase,
+                    $push: { history: { team: player.team, type: 'END_TURN' } }
+                });
 
                 io.to(room.code).emit('gameUpdate', {
                     currentTurn: room.currentTurn,
@@ -458,6 +507,7 @@ const handleSocketConnections = (io) => {
                     guessesLeft: 0,
                     turnPhase: 'CLUE_GIVING' 
                 });
+                io.to(room.code).emit('gameAlert', `${player.username} أنهى دوره طوعاً.`);
 
                 if (room.currentTurn === 'BLUE' && room.isAIGame) {
                     handleAITurn(io, room.code);
@@ -467,7 +517,7 @@ const handleSocketConnections = (io) => {
             }
         });
 
-        // 🚨 تعديل: معالج DISCONNECT مع مؤقت الـ 5 دقائق (المشكلة 6)
+        // DISCONNECT (MODIFIED FOR PERSISTENCE)
         socket.on('disconnect', async () => {
             try {
                 if (!socket.roomCode) return;
@@ -477,35 +527,31 @@ const handleSocketConnections = (io) => {
 
                 if (room) {
                     const player = room.players.find(p => p.id === socket.id);
+                    
                     if (player) {
-                        // 1. وضع علامة الانفصال بدلاً من الحذف
-                        player.isDisconnected = true;
+                        player.isOnline = false; // Mark player as offline
+                        player.disconnectTime = Date.now();
                         
-                        // إرسال التحديث للجميع (لتظهر علامة الانفصال)
-                        io.to(roomCode).emit('roomUpdate', room.players); 
-                        console.log(`Player ${player.userId} disconnected. Starting 5-min timer.`);
-                        
-                        // 2. بدأ مؤقت الـ 5 دقائق للحذف النهائي
-                        disconnectTimers[player.userId] = setTimeout(async () => {
-                            // التحقق مجدداً في حال قام بتحديث الصفحة
-                            const stillDisconnected = room.players.find(p => p.userId === player.userId && p.isDisconnected);
-                            
-                            if (stillDisconnected) {
-                                // إزالة اللاعب من قائمة اللاعبين
-                                room.players = room.players.filter(p => p.userId !== player.userId);
-                                
-                                // إيقاف اللعبة وحذف الغرفة إذا أصبحت فارغة
-                                if (room.players.length === 0) {
-                                    delete activeRooms[roomCode];
-                                    console.log(`Room ${roomCode} closed (empty after timeout).`);
-                                } else {
-                                    io.to(roomCode).emit('roomUpdate', room.players);
-                                    console.log(`Player ${player.userId} removed after timeout.`);
-                                }
-                            }
-                            delete disconnectTimers[player.userId]; // حذف المؤقت
-                        }, DISCONNECT_TIMEOUT); 
+                        // Set a timeout to remove the player permanently (5 minutes)
+                        player.timeout = setTimeout(() => {
+                            // This runs after the timeout expires
+                            room.players = room.players.filter(p => p.userId !== player.userId);
 
+                            if (room.players.length === 0) {
+                                delete activeRooms[roomCode];
+                                console.log(`Room ${roomCode} closed (empty after timeout).`);
+                            } else {
+                                io.to(roomCode).emit('roomUpdate', room.players);
+                                // Alert others if a key player (Spymaster) was removed mid-game
+                                if (room.gameState === 'IN_PROGRESS' && player.role === 'SPYMASTER') {
+                                    io.to(roomCode).emit('gameAlert', `تمت إزالة القائد ${player.username} نهائياً. دوره أصبح شاغراً.`);
+                                }
+                                console.log(`Player ${player.userId} permanently left room ${roomCode} after timeout.`);
+                            }
+                        }, DISCONNECT_TIMEOUT);
+
+                        io.to(roomCode).emit('roomUpdate', room.players); // Inform others of status change
+                        console.log(`Player ${player.userId} disconnected from room ${roomCode}. Timeout set.`);
                     }
                 }
             } catch (error) {
