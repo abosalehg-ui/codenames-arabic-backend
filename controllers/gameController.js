@@ -4,14 +4,33 @@ const { v4: uuidv4 } = require('uuid');
 const { initializeGameBoard } = require('./gameSetup');
 const { makeAIGuess } = require('../utils/aiGuesser');
 
-const activeRooms = {}; 
+const activeRooms = {};
+const ROOM_EXPIRY = 5 * 60 * 1000; // 5 minutes
 
-// دوال مساعدة
+// ============================================
+// 🧹 ROOM CLEANUP - Auto-delete expired rooms
+// ============================================
+setInterval(() => {
+    const now = Date.now();
+    Object.keys(activeRooms).forEach(code => {
+        const room = activeRooms[code];
+        if (room.lastActivity && (now - room.lastActivity > ROOM_EXPIRY)) {
+            delete activeRooms[code];
+            console.log(`Room ${code} expired and deleted`);
+        }
+    });
+}, 60 * 1000); // Check every minute
+
+// ============================================
+// 🔧 HELPER FUNCTIONS
+// ============================================
 const getRoom = (roomCode) => roomCode ? activeRooms[roomCode.toUpperCase()] : null;
-const getPlayer = (room, socketId) => room ? room.players.find(p => p.id === socketId) : null;
+const getPlayer = (room, socketId) => room ? room.players.find(p => p.id === socketId || p.socketId === socketId) : null;
+const getPlayerByUserId = (room, userId) => room ? room.players.find(p => p.userId === userId) : null;
 const isSpymaster = (player) => player && player.role === 'SPYMASTER';
 const isGuesser = (player) => player && player.role === 'GUESSER';
 const isMyTurn = (room, player) => player && room && room.currentTurn === player.team;
+
 const normalizeArabic = (text) => {
     if (!text) return '';
     return text.normalize("NFD")
@@ -20,7 +39,6 @@ const normalizeArabic = (text) => {
         .replace(/ى/g, 'ي');
 };
 
-// منطق التحقق من الفوز
 const checkWinCondition = (board) => {
     if (!board) return null;
     
@@ -38,7 +56,9 @@ const checkWinCondition = (board) => {
     return null;
 };
 
-// دالة معالجة دور الذكاء الاصطناعي (AI)
+// ============================================
+// 🤖 AI TURN HANDLER
+// ============================================
 const handleAITurn = (io, roomCode) => {
     const room = getRoom(roomCode);
     if (!room || room.gameState !== 'IN_PROGRESS' || room.currentTurn !== 'BLUE') return;
@@ -47,7 +67,7 @@ const handleAITurn = (io, roomCode) => {
         let game = await Game.findById(room.currentGameId);
         if (!game) return;
 
-        room.clue = "كلمة_آلية"; 
+        room.clue = "كلمة_آلية";
         room.guessesLeft = 9 + 1;
         
         io.to(room.code).emit('clueGiven', { clue: room.clue, count: 9, team: 'BLUE' });
@@ -58,7 +78,6 @@ const handleAITurn = (io, roomCode) => {
         });
 
         while (room.guessesLeft > 0 && room.currentTurn === 'BLUE' && room.gameState === 'IN_PROGRESS') {
-            
             const aiDecision = makeAIGuess(room.board, room.currentTurn, room.guessesLeft);
             
             if (aiDecision.action === 'END_TURN') {
@@ -77,7 +96,7 @@ const handleAITurn = (io, roomCode) => {
                 let winnerTeam = checkWinCondition(room.board);
 
                 if (result === 'ASSASSIN') {
-                    winnerTeam = 'RED'; 
+                    winnerTeam = 'RED';
                 } else if (result !== room.currentTurn) {
                     turnOver = true;
                 } else if (room.guessesLeft === 0) {
@@ -101,6 +120,7 @@ const handleAITurn = (io, roomCode) => {
                     game.gameState = 'FINISHED';
                 }
 
+                room.lastActivity = Date.now();
                 await game.save();
 
                 io.to(room.code).emit('gameUpdate', { 
@@ -111,41 +131,47 @@ const handleAITurn = (io, roomCode) => {
                 });
                 
                 if (turnOver || winnerTeam) break;
-                await new Promise(resolve => setTimeout(resolve, 1500)); 
+                await new Promise(resolve => setTimeout(resolve, 1500));
             }
         }
     }, 1000);
 };
 
-// الدالة الرئيسية لمعالجة اتصالات Socket.io
+// ============================================
+// 🎮 MAIN SOCKET HANDLER
+// ============================================
 const handleSocketConnections = (io) => {
-    
     io.on('connection', (socket) => {
         console.log('New client connected:', socket.id);
         
+        // ==========================================
         // CREATE ROOM
+        // ==========================================
         socket.on('createRoom', async (data) => {
             try {
                 const roomCode = (data.customName || uuidv4().substring(0, 6)).toUpperCase();
                 
-                if (activeRooms[roomCode]) { 
-                    socket.emit('roomError', 'هذا الكود مستخدم مسبقاً.'); 
-                    return; 
+                if (activeRooms[roomCode]) {
+                    socket.emit('roomError', 'هذا الكود مستخدم مسبقاً.');
+                    return;
                 }
 
                 socket.join(roomCode);
                 activeRooms[roomCode] = {
                     code: roomCode,
                     players: [{ 
-                        id: socket.id, 
-                        username: data.username || 'لاعب', 
-                        team: null, 
-                        role: null, 
-                        userId: data.userId 
+                        id: socket.id,
+                        socketId: socket.id,
+                        username: data.username || 'لاعب',
+                        team: null,
+                        role: null,
+                        userId: data.userId,
+                        ready: false
                     }],
                     gameState: 'WAITING',
                     isAIGame: data.isAIGame || false,
-                    history: []
+                    history: [],
+                    lastActivity: Date.now()
                 };
                 socket.roomCode = roomCode;
                 
@@ -159,31 +185,44 @@ const handleSocketConnections = (io) => {
             }
         });
 
+        // ==========================================
         // JOIN ROOM
+        // ==========================================
         socket.on('joinRoom', async (data) => {
             try {
                 const roomCode = data.roomCode ? data.roomCode.toUpperCase() : null;
                 const room = getRoom(roomCode);
 
-                if (!room) { 
-                    socket.emit('roomError', 'الغرفة غير موجودة أو انتهت.'); 
-                    return; 
+                if (!room) {
+                    socket.emit('roomError', 'الغرفة غير موجودة أو انتهت.');
+                    return;
                 }
-                if (room.gameState !== 'WAITING') { 
-                    socket.emit('roomError', 'لا يمكن الانضمام، اللعبة قيد التقدم.'); 
-                    return; 
+                if (room.gameState !== 'WAITING') {
+                    socket.emit('roomError', 'لا يمكن الانضمام، اللعبة قيد التقدم.');
+                    return;
+                }
+
+                // Check if user already in room
+                const existingPlayer = getPlayerByUserId(room, data.userId);
+                if (existingPlayer) {
+                    socket.emit('roomError', 'أنت موجود بالفعل في الغرفة');
+                    return;
                 }
 
                 socket.join(roomCode);
                 room.players.push({ 
-                    id: socket.id, 
-                    username: data.username || 'لاعب', 
-                    team: null, 
-                    role: null, 
-                    userId: data.userId 
+                    id: socket.id,
+                    socketId: socket.id,
+                    username: data.username || 'لاعب',
+                    team: null,
+                    role: null,
+                    userId: data.userId,
+                    ready: false
                 });
-                socket.roomCode = roomCode; 
+                socket.roomCode = roomCode;
+                room.lastActivity = Date.now();
                 
+                socket.emit('roomJoined', room);
                 io.to(roomCode).emit('roomUpdate', room.players);
                 
                 console.log(`Player ${socket.id} joined room: ${roomCode}`);
@@ -192,8 +231,65 @@ const handleSocketConnections = (io) => {
                 socket.emit('roomError', 'فشل الانضمام للغرفة.');
             }
         });
+
+        // ==========================================
+        // RECONNECT TO ROOM - NEW
+        // ==========================================
+        socket.on('reconnectToRoom', async ({ roomCode, userId, username }) => {
+            try {
+                const room = getRoom(roomCode);
+                
+                if (!room) {
+                    socket.emit('reconnectError', 'الغرفة غير موجودة أو انتهت صلاحيتها');
+                    return;
+                }
+                
+                const player = getPlayerByUserId(room, userId);
+                
+                if (!player) {
+                    socket.emit('reconnectError', 'لم يتم العثور على بيانات اللاعب');
+                    return;
+                }
+                
+                // Update socket ID
+                player.socketId = socket.id;
+                player.id = socket.id;
+                socket.roomCode = roomCode;
+                room.lastActivity = Date.now();
+                
+                socket.join(roomCode);
+                
+                // Send appropriate response based on game state
+                if (room.gameState === 'IN_PROGRESS') {
+                    socket.emit('roomReconnected', {
+                        code: roomCode,
+                        gameStarted: true,
+                        board: room.board,
+                        currentTurn: room.currentTurn,
+                        clue: room.clue,
+                        guessesLeft: room.guessesLeft,
+                        players: room.players
+                    });
+                } else {
+                    socket.emit('roomReconnected', {
+                        code: roomCode,
+                        gameStarted: false,
+                        players: room.players
+                    });
+                }
+                
+                io.to(roomCode).emit('roomUpdate', room.players);
+                console.log(`${username} reconnected to room ${roomCode}`);
+                
+            } catch (error) {
+                console.error('Error reconnecting:', error);
+                socket.emit('reconnectError', 'فشل إعادة الاتصال');
+            }
+        });
         
+        // ==========================================
         // SET ROLE
+        // ==========================================
         socket.on('setRole', (data) => {
             try {
                 const room = getRoom(socket.roomCode);
@@ -203,7 +299,7 @@ const handleSocketConnections = (io) => {
                 const player = getPlayer(room, socket.id);
 
                 const isRoleTaken = room.players.some(p => 
-                    p.team === team && p.role === role && p.id !== socket.id
+                    p.team === team && p.role === role && (p.id !== socket.id && p.socketId !== socket.id)
                 );
 
                 if (isRoleTaken && role === 'SPYMASTER') {
@@ -214,6 +310,7 @@ const handleSocketConnections = (io) => {
                 if (player) {
                     player.team = team;
                     player.role = role;
+                    room.lastActivity = Date.now();
                     io.to(room.code).emit('roomUpdate', room.players);
                 }
             } catch (error) {
@@ -222,7 +319,29 @@ const handleSocketConnections = (io) => {
             }
         });
 
-        // START GAME
+        // ==========================================
+        // PLAYER READY - NEW
+        // ==========================================
+        socket.on('playerReady', ({ ready }) => {
+            try {
+                const room = getRoom(socket.roomCode);
+                if (!room) return;
+                
+                const player = getPlayer(room, socket.id);
+                if (player) {
+                    player.ready = ready;
+                    room.lastActivity = Date.now();
+                    io.to(room.code).emit('playerReady', { playerId: socket.id, ready });
+                    io.to(room.code).emit('roomUpdate', room.players);
+                }
+            } catch (error) {
+                console.error('Error setting ready status:', error);
+            }
+        });
+
+        // ==========================================
+        // START GAME - UPDATED (Auto-start when all ready)
+        // ==========================================
         socket.on('startGame', async () => {
             try {
                 const room = getRoom(socket.roomCode);
@@ -236,7 +355,16 @@ const handleSocketConnections = (io) => {
                     return;
                 }
 
-                const gameData = initializeGameBoard(); 
+                // Check if all players with roles are ready
+                const playersWithRoles = room.players.filter(p => p.team && p.role);
+                const allReady = playersWithRoles.every(p => p.ready);
+                
+                if (!allReady && playersWithRoles.length >= 4) {
+                    socket.emit('gameError', 'جميع اللاعبين يجب أن يكونوا جاهزين');
+                    return;
+                }
+
+                const gameData = initializeGameBoard();
                 
                 const newGame = await Game.create({
                     roomCode: room.code,
@@ -244,10 +372,10 @@ const handleSocketConnections = (io) => {
                     currentTurn: gameData.currentTurn,
                     firstTeam: gameData.firstTeam,
                     players: room.players.map(p => ({
-                        socketId: p.id, 
-                        userId: p.userId, 
-                        username: p.username, 
-                        team: p.team, 
+                        socketId: p.id,
+                        userId: p.userId,
+                        username: p.username,
+                        team: p.team,
                         role: p.role
                     })),
                     gameState: 'IN_PROGRESS',
@@ -257,10 +385,11 @@ const handleSocketConnections = (io) => {
                 room.currentGameId = newGame._id;
                 room.board = newGame.board;
                 room.currentTurn = newGame.currentTurn;
+                room.lastActivity = Date.now();
 
                 io.to(room.code).emit('gameStarted', {
                     ...newGame.toObject(),
-                    players: room.players 
+                    players: room.players
                 });
                 
                 console.log(`Game started in room: ${room.code}`);
@@ -274,14 +403,16 @@ const handleSocketConnections = (io) => {
             }
         });
         
+        // ==========================================
         // GIVE CLUE
+        // ==========================================
         socket.on('giveClue', async (data) => {
             try {
                 const room = getRoom(socket.roomCode);
                 if (!room || room.gameState !== 'IN_PROGRESS' || room.currentTurn === 'BLUE') return;
 
                 const player = getPlayer(room, socket.id);
-                const { clue, count } = data; 
+                const { clue, count } = data;
 
                 if (!player || !isSpymaster(player) || !isMyTurn(room, player)) {
                     socket.emit('clueError', 'ليس دورك أو ليس مسموحاً لك بإعطاء تلميح.');
@@ -299,7 +430,8 @@ const handleSocketConnections = (io) => {
                 }
 
                 room.clue = clue;
-                room.guessesLeft = count + 1; 
+                room.guessesLeft = count + 1;
+                room.lastActivity = Date.now();
 
                 let game = await Game.findById(room.currentGameId);
                 if (!game) return;
@@ -309,9 +441,9 @@ const handleSocketConnections = (io) => {
 
                 io.to(room.code).emit('clueGiven', { clue, count, team: player.team });
                 io.to(room.code).emit('gameUpdate', { 
-                    clue: room.clue, 
+                    clue: room.clue,
                     guessesLeft: room.guessesLeft,
-                    turnPhase: 'GUESSING' 
+                    turnPhase: 'GUESSING'
                 });
             } catch (error) {
                 console.error('Error giving clue:', error);
@@ -319,7 +451,9 @@ const handleSocketConnections = (io) => {
             }
         });
 
+        // ==========================================
         // MAKE GUESS
+        // ==========================================
         socket.on('makeGuess', async (data) => {
             try {
                 const room = getRoom(socket.roomCode);
@@ -344,7 +478,7 @@ const handleSocketConnections = (io) => {
 
                 if (result === 'ASSASSIN') {
                     winnerTeam = (player.team === 'RED') ? 'BLUE' : 'RED';
-                    turnOver = true; 
+                    turnOver = true;
                 } else if (result !== player.team) {
                     turnOver = true;
                 } else if (room.guessesLeft === 0) {
@@ -370,6 +504,7 @@ const handleSocketConnections = (io) => {
                     game.gameState = 'FINISHED';
                 }
 
+                room.lastActivity = Date.now();
                 await game.save();
 
                 io.to(room.code).emit('cardRevealed', { cardIndex, card: room.board[cardIndex], result });
@@ -389,7 +524,9 @@ const handleSocketConnections = (io) => {
             }
         });
         
+        // ==========================================
         // END TURN
+        // ==========================================
         socket.on('endTurn', async () => {
             try {
                 const room = getRoom(socket.roomCode);
@@ -401,7 +538,8 @@ const handleSocketConnections = (io) => {
                 const nextTeam = room.currentTurn === 'RED' ? 'BLUE' : 'RED';
                 room.currentTurn = nextTeam;
                 room.clue = null;
-                room.guessesLeft = 0; 
+                room.guessesLeft = 0;
+                room.lastActivity = Date.now();
 
                 let game = await Game.findById(room.currentGameId);
                 if (!game) return;
@@ -414,7 +552,7 @@ const handleSocketConnections = (io) => {
                     currentTurn: room.currentTurn,
                     clue: null,
                     guessesLeft: 0,
-                    turnPhase: 'CLUE_GIVING' 
+                    turnPhase: 'CLUE_GIVING'
                 });
 
                 if (room.currentTurn === 'BLUE' && room.isAIGame) {
@@ -425,23 +563,49 @@ const handleSocketConnections = (io) => {
             }
         });
 
-        // DISCONNECT
-        socket.on('disconnect', async () => {
+        // ==========================================
+        // LEAVE ROOM - NEW
+        // ==========================================
+        socket.on('leaveRoom', () => {
             try {
-                if (!socket.roomCode) return;
-                
                 const roomCode = socket.roomCode;
-                const room = activeRooms[roomCode];
-
+                const room = getRoom(roomCode);
+                
                 if (room) {
-                    room.players = room.players.filter(p => p.id !== socket.id);
+                    room.players = room.players.filter(p => p.socketId !== socket.id && p.id !== socket.id);
                     
                     if (room.players.length === 0) {
                         delete activeRooms[roomCode];
-                        console.log(`Room ${roomCode} closed (empty).`);
+                        console.log(`Room ${roomCode} closed (empty)`);
                     } else {
+                        room.lastActivity = Date.now();
                         io.to(roomCode).emit('roomUpdate', room.players);
                         console.log(`Player ${socket.id} left room ${roomCode}`);
+                    }
+                    
+                    socket.leave(roomCode);
+                    socket.roomCode = null;
+                }
+            } catch (error) {
+                console.error('Error leaving room:', error);
+            }
+        });
+
+        // ==========================================
+        // DISCONNECT
+        // ==========================================
+        socket.on('disconnect', async () => {
+            try {
+                console.log(`User disconnected: ${socket.id}`);
+                
+                // Don't remove player immediately - allow reconnection for 5 minutes
+                // Player data stays in room.players for reconnection
+                
+                if (socket.roomCode) {
+                    const room = getRoom(socket.roomCode);
+                    if (room) {
+                        room.lastActivity = Date.now();
+                        console.log(`Player ${socket.id} disconnected from room ${socket.roomCode} (reconnection allowed)`);
                     }
                 }
             } catch (error) {
