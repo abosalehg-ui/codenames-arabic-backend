@@ -12,7 +12,7 @@ const GameSchema = new mongoose.Schema({
     roomCode: {
         type: String,
         required: true,
-        unique: true,
+        index: true, // ليس unique — الغرفة الواحدة تُنشئ ألعاباً متعددة (سجل لكل جولة)
         uppercase: true,
         trim: true
     },
