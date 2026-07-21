@@ -19,20 +19,26 @@ const app = express();
 const httpServer = http.createServer(app); // إنشاء سيرفر HTTP
 
 // 2. إعدادات CORS و Socket.io
+// FRONTEND_URL يدعم أكثر من نطاق مفصولة بفواصل؛ إن لم يُعرَّف (تطوير محلي) يُسمح للجميع
+const allowedOrigins = (process.env.FRONTEND_URL || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+const corsOrigin = allowedOrigins.length > 0 ? allowedOrigins : true;
+
 const io = new Server(httpServer, {
     cors: {
-        // 🚨 السماح للطلبات القادمة من الواجهة الأمامية (GitHub Pages)
-        origin: process.env.FRONTEND_URL, 
+        origin: corsOrigin,
         methods: ["GET", "POST"]
     }
 });
 
 // 3. تجهيز Middlewares
-app.use(express.json()); // للسماح بتحليل بيانات JSON في جسم الطلب (req.body)
+app.use(express.json({ limit: '10kb' })); // للسماح بتحليل بيانات JSON في جسم الطلب (req.body)
 
-// تفعيل CORS لـ Express API أيضاً باستخدام FRONTEND_URL
+// تفعيل CORS لـ Express API أيضاً
 app.use(cors({
-    origin: process.env.FRONTEND_URL
+    origin: corsOrigin
 }));
 
 // 4. مسارات API (RESTful Endpoints)
@@ -59,4 +65,6 @@ app.get('/api/test', (req, res) => {
 // 7. تشغيل الخادم
 const PORT = process.env.PORT || 5000;
 
-httpServer.listen(PORT, console.log(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`));
+httpServer.listen(PORT, () => {
+    console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
+});
