@@ -1,64 +1,80 @@
 const User = require('../models/User');
-const Stats = require('../models/Stats');
 const generateToken = require('../utils/generateToken');
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MIN_PASSWORD_LENGTH = 8;
+
+// رسائل الخطأ الداخلية لا تُرسل للعميل — تُسجَّل فقط
+const serverError = (res, context, error) => {
+    console.error(`❌ ${context}:`, error.message);
+    res.status(500).json({ message: 'حدث خطأ في الخادم. حاول مرة أخرى.' });
+};
+
+const validateCredentials = ({ username, email, password }, { requireUsername }) => {
+    if (requireUsername) {
+        if (typeof username !== 'string' || username.trim().length < 2 || username.trim().length > 20) {
+            return 'اسم المستخدم يجب أن يكون بين 2 و 20 حرفاً.';
+        }
+    }
+    if (typeof email !== 'string' || !EMAIL_RE.test(email.trim()) || email.length > 254) {
+        return 'البريد الإلكتروني غير صالح.';
+    }
+    if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH || password.length > 128) {
+        return `كلمة المرور يجب أن تكون ${MIN_PASSWORD_LENGTH} أحرف على الأقل.`;
+    }
+    return null;
+};
 
 // @الوصف: تسجيل مستخدم جديد
 // @المسار: POST /api/users/register
-// @الوصول: عام
 exports.registerUser = async (req, res) => {
-  const { username, email, password } = req.body;
+    const invalid = validateCredentials(req.body || {}, { requireUsername: true });
+    if (invalid) return res.status(400).json({ message: invalid });
 
-  try {
-    const userExists = await User.findOne({ email });
+    const username = req.body.username.trim();
+    const email = req.body.email.trim().toLowerCase();
+    const { password } = req.body;
 
-    if (userExists) {
-      return res.status(400).json({ message: 'البريد الإلكتروني مستخدم مسبقاً.' });
+    try {
+        const exists = await User.findOne({ $or: [{ email }, { username }] });
+        if (exists) {
+            return res.status(400).json({ message: 'البريد الإلكتروني أو اسم المستخدم مستخدم مسبقاً.' });
+        }
+
+        const user = await User.create({ username, email, password });
+        res.status(201).json({
+            _id: user._id,
+            username: user.username,
+            email: user.email,
+            token: generateToken(user._id)
+        });
+    } catch (error) {
+        serverError(res, 'registerUser', error);
     }
-
-    const user = await User.create({ username, email, password });
-
-    if (user) {
-      // 1. إنشاء سجل إحصائيات للمستخدم الجديد
-      const userStats = await Stats.create({ userId: user._id });
-      // 2. ربط سجل الإحصائيات بحساب المستخدم
-      user.stats = userStats._id;
-      await user.save();
-      
-      res.status(201).json({
-        _id: user._id,
-        username: user.username,
-        email: user.email,
-        token: generateToken(user._id),
-      });
-    } else {
-      res.status(400).json({ message: 'بيانات مستخدم غير صالحة.' });
-    }
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
 };
 
 // @الوصف: تسجيل دخول المستخدم
 // @المسار: POST /api/users/login
-// @الوصول: عام
 exports.loginUser = async (req, res) => {
-  const { email, password } = req.body;
+    const invalid = validateCredentials(req.body || {}, { requireUsername: false });
+    if (invalid) return res.status(401).json({ message: 'بريد إلكتروني أو كلمة مرور غير صحيحة.' });
 
-  try {
-    const user = await User.findOne({ email });
+    const email = req.body.email.trim().toLowerCase();
+    const { password } = req.body;
 
-    // استخدام دالة matchPassword المعرفة في نموذج User.js
-    if (user && (await user.matchPassword(password))) {
-      res.json({
-        _id: user._id,
-        username: user.username,
-        email: user.email,
-        token: generateToken(user._id),
-      });
-    } else {
-      res.status(401).json({ message: 'بريد إلكتروني أو كلمة مرور غير صحيحة.' });
+    try {
+        const user = await User.findOne({ email }).select('+password');
+        if (user && (await user.matchPassword(password))) {
+            res.json({
+                _id: user._id,
+                username: user.username,
+                email: user.email,
+                token: generateToken(user._id)
+            });
+        } else {
+            res.status(401).json({ message: 'بريد إلكتروني أو كلمة مرور غير صحيحة.' });
+        }
+    } catch (error) {
+        serverError(res, 'loginUser', error);
     }
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
 };

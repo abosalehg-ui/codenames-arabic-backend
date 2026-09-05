@@ -1,0 +1,35 @@
+# الأمن — خطوات مطلوبة يدوياً
+
+## 🔴 سر مسرَّب في تاريخ git (إجراء فوري)
+
+ملف `.env` كان مُتتبَّعاً في هذا المستودع في commits قديمة ثم حُذف. **الحذف لا يمسح التاريخ**: أي شخص
+يستنسخ المستودع يستطيع قراءة كلمة مرور MongoDB Atlas و`JWT_SECRET` القديمَين بأمر `git log -p`.
+
+الترتيب مهم — الخطوة 1 هي التي تحمي فعلاً، والباقي تنظيف:
+
+1. **بدّل كلمة مرور قاعدة البيانات الآن** في MongoDB Atlas → Database Access → المستخدم `abosalehg_db_user`
+   → Edit → Edit Password (أو احذفه وأنشئ مستخدماً جديداً). ثم حدّث `MONGO_URI` في متغيرات بيئة Render.
+2. في Atlas → Network Access: احذف `0.0.0.0/0` إن وُجد، وأضف عناوين Render الصادرة فقط.
+3. راجع Atlas → Activity Feed / Database Access History بحثاً عن وصول غير معروف.
+4. **بدّل `JWT_SECRET`** في Render (`openssl rand -base64 48`). التوكنات القديمة ستبطل — لا مستخدمين فعليين حالياً فلا أثر.
+5. **امسح الملف من التاريخ** (يعيد كتابة كل الفروع — نسّق مع أي متعاون ليعيد الاستنساخ بعدها):
+   ```bash
+   pip install git-filter-repo
+   git clone --mirror https://github.com/abosalehg-ui/codenames-arabic-backend.git purge && cd purge
+   git filter-repo --path .env --invert-paths
+   git push --force --all && git push --force --tags
+   ```
+   إن كان المستودع عاماً فاعتبر السر منسوخاً حتى بعد المسح — لذلك الخطوة 1 أولاً.
+6. في GitHub → Settings → Code security: فعّل **Secret scanning** و **Push protection**.
+
+## ممارسات قائمة في الكود
+
+- `.env` في `.gitignore`، و`.env.example` بقيم وهمية فقط.
+- الخادم يرفض التشغيل في الإنتاج بلا `FRONTEND_URL` (لا CORS مفتوح بالخطأ).
+- نظام المستخدمين معطّل افتراضياً (`ENABLE_AUTH_API=false`)، وعند تفعيله: حد معدل 10 محاولات / 15 دقيقة، تحقق من المدخلات، ولا تُرسل رسائل الخطأ الداخلية للعميل.
+- حدود على الخادم: 500 غرفة، 20 اتصالاً لكل IP، 30 حدثاً / 5 ثوانٍ لكل اتصال، 10kb لجسم الطلب.
+- المخمّنون لا يستلمون ألوان البطاقات غير المكشوفة إطلاقاً (انظر `controllers/gameLogic.js`).
+
+## الإبلاغ عن ثغرة
+
+افتح Issue خاصاً (Security advisory) في المستودع أو راسل صاحب المستودع مباشرة.

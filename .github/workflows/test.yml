@@ -1,0 +1,28 @@
+name: Tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Integration test (full game over socket.io)
+        run: npm run test:integration
+
+      - name: Dependency audit (production, high+)
+        run: npm audit --omit=dev --audit-level=high

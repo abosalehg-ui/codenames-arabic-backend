@@ -1,8 +1,10 @@
 /**
- * اختبار تكاملي كامل: يشغّل الخادم ويحاكي 4 لاعبين عبر socket.io-client
+ * اختبار تكاملي كامل: يشغّل الخادم ويحاكي لاعبين عبر socket.io-client
  * يغطي: إنشاء/انضمام، الأدوار، بدء المضيف فقط، تعقيم اللوحة حسب الدور،
- * تخمين الفريقين (خصوصاً الفريق الثاني)، إنهاء الدور، إعادة الاتصال أثناء
- * اللعبة، القاتل وإنهاء اللعبة، والعودة للوبي (playAgain).
+ * تخمين الفريقين، إنهاء الدور، إعادة الاتصال أثناء اللعبة، القاتل وإنهاء اللعبة،
+ * إعادة الاتصال بعد النهاية (FINISHED)، العودة للوبي (playAgain)،
+ * منع المضيف الشبح، حد الغرف، التبويب الثاني (seatTaken)، مؤقّت الدور،
+ * أخذ مقعد قائد منقطع، ومغادرة قائد بلا زملاء (gameAborted) وإنهاء المضيف (abortGame).
  *
  * التشغيل: npm run test:integration
  */
@@ -16,6 +18,7 @@ const ROOM = 'TESTAA';
 
 const fail = (msg) => { console.error(`❌ FAIL: ${msg}`); process.exitCode = 1; throw new Error(msg); };
 const ok = (msg) => console.log(`✅ ${msg}`);
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // انتظار أول حدث "مطابق للشرط" — الأحداث تُبث للجميع وقد يصل تحديث قديم
 // متأخراً، فالانتظار بلا شرط يلتقط الحدث الخطأ (سباق)
@@ -33,6 +36,16 @@ const once = (socket, event, pred = () => true, timeout = 8000) => new Promise((
     socket.on(event, handler);
 });
 
+// التأكد من أن حدثاً معيناً لا يصل خلال مهلة
+const never = async (socket, event, ms = 400) => {
+    let got = false;
+    const h = () => { got = true; };
+    socket.on(event, h);
+    await sleep(ms);
+    socket.off(event, h);
+    return !got;
+};
+
 const connect = () => {
     const s = io(URL, { transports: ['websocket'], reconnection: false });
     return once(s, 'connect').then(() => s);
@@ -44,11 +57,27 @@ const assertSanitized = (board, who) => {
     ok(`${who}: اللوحة معقّمة (لا ألوان مسرّبة)`);
 };
 
+const setupFullRoom = async (code, names) => {
+    const [h, g1, s2, g2] = await Promise.all([connect(), connect(), connect(), connect()]);
+    h.emit('createRoom', { customName: code, username: 'H', userId: names.h });
+    await once(h, 'roomCreated');
+    for (const [s, n, u] of [[g1, 'G1', names.g1], [s2, 'S2', names.s2], [g2, 'G2', names.g2]]) {
+        s.emit('joinRoom', { roomCode: code, username: n, userId: u });
+        await once(s, 'roomJoined');
+    }
+    h.emit('setRole', { team: 'RED', role: 'SPYMASTER' });
+    g1.emit('setRole', { team: 'RED', role: 'GUESSER' });
+    s2.emit('setRole', { team: 'BLUE', role: 'SPYMASTER' });
+    g2.emit('setRole', { team: 'BLUE', role: 'GUESSER' });
+    await once(h, 'roomUpdate', ps => ps.filter(p => p.role).length === 4);
+    return { h, g1, s2, g2 };
+};
+
 const main = async () => {
     // 1) تشغيل الخادم بدون قاعدة بيانات
     const server = spawn('node', ['server.js'], {
         cwd: path.join(__dirname, '..'),
-        env: { ...process.env, PORT: String(PORT), MONGO_URI: '', FRONTEND_URL: '' },
+        env: { ...process.env, PORT: String(PORT), MONGO_URI: '', FRONTEND_URL: '', NODE_ENV: 'test' },
         stdio: ['ignore', 'pipe', 'pipe']
     });
     server.stderr.on('data', d => process.stderr.write(`[server] ${d}`));
@@ -61,7 +90,7 @@ const main = async () => {
     ok('الخادم يعمل');
 
     try {
-        // 2) أربعة لاعبين
+        // ================= اللعبة الأساسية =================
         const ids = { c1: 'uid-host-1', c2: 'uid-red-g', c3: 'uid-blue-s', c4: 'uid-blue-g' };
         const c1 = await connect(); // المضيف — قائد أحمر
         const c2 = await connect(); // مخمن أحمر
@@ -72,7 +101,8 @@ const main = async () => {
         const created = await once(c1, 'roomCreated');
         if (created.code !== ROOM) fail('كود الغرفة غير مطابق');
         if (created.players.some(p => p.userId)) fail('userId يُبث للجميع (تسريب هوية)');
-        ok('إنشاء الغرفة + عدم بث userId');
+        if (!created.settings || typeof created.settings.turnDuration !== 'number') fail('إعدادات الغرفة غائبة');
+        ok('إنشاء الغرفة + عدم بث userId + إعدادات الغرفة');
 
         for (const [c, name, uid] of [[c2, 'أحمد', ids.c2], [c3, 'سارة', ids.c3], [c4, 'خالد', ids.c4]]) {
             c.emit('joinRoom', { roomCode: ROOM, username: name, userId: uid });
@@ -84,31 +114,51 @@ const main = async () => {
         const c5 = await connect();
         c5.emit('joinRoom', { roomCode: ROOM, username: '<img src=x onerror=alert(1)>', userId: 'uid-x' });
         const j5 = await once(c5, 'roomJoined');
-        const evil = j5.players.find(p => p.username.includes('<') || p.username.includes('>'));
-        if (evil) fail('اسم لاعب يحتوي وسوم HTML وصل كما هو');
+        if (j5.players.some(p => p.username.includes('<') || p.username.includes('>'))) fail('اسم لاعب يحتوي وسوم HTML وصل كما هو');
         ok('تعقيم أسماء اللاعبين');
         c5.emit('leaveRoom');
         c5.disconnect();
 
-        // 3) الأدوار
+        // المضيف الشبح: لاعب في غرفة ينشئ غرفة أخرى → يجب أن يُزال من الأولى
+        const ghost = await connect();
+        ghost.emit('joinRoom', { roomCode: ROOM, username: 'شبح', userId: 'uid-ghost' });
+        await once(ghost, 'roomJoined');
+        const leftP = once(c1, 'playerLeft', d => d.username === 'شبح');
+        ghost.emit('createRoom', { username: 'شبح', userId: 'uid-ghost' });
+        const ghostRoom = await once(ghost, 'roomCreated');
+        await leftP;
+        if (!/^[A-Z0-9]{6}$/.test(ghostRoom.code)) fail(`كود مولّد غير صالح: ${ghostRoom.code}`);
+        ok('لا لاعب شبح: إنشاء غرفة ثانية أزال اللاعب من الأولى');
+        ghost.disconnect();
+
+        // غير المضيف لا يغيّر المؤقّت؛ المضيف يغيّره
+        c2.emit('setTimer', { turnDuration: 60 });
+        await once(c2, 'gameError');
+        c1.emit('setTimer', { turnDuration: 0 });
+        const settings = await once(c1, 'roomSettings');
+        if (settings.turnDuration !== 0) fail('المؤقّت لم يتغيّر');
+        ok('المضيف فقط يغيّر مدة الدور');
+
+        // الأدوار
         c1.emit('setRole', { team: 'RED', role: 'SPYMASTER' });
         c2.emit('setRole', { team: 'RED', role: 'GUESSER' });
         c3.emit('setRole', { team: 'BLUE', role: 'SPYMASTER' });
         c4.emit('setRole', { team: 'BLUE', role: 'GUESSER' });
-        await once(c1, 'roomUpdate');
+        await once(c1, 'roomUpdate', ps => ps.filter(p => p.role).length === 4);
 
-        // 4) غير المضيف لا يستطيع البدء
+        // غير المضيف لا يستطيع البدء
         c2.emit('startGame');
         await once(c2, 'gameError');
         ok('غير المضيف مُنع من بدء اللعبة');
 
-        // 5) بدء اللعبة والتحقق من التعقيم
-        const started = [once(c1, 'gameStarted'), once(c2, 'gameStarted'), once(c3, 'gameStarted'), once(c4, 'gameStarted')];
+        // بدء اللعبة والتحقق من التعقيم
+        const started = [c1, c2, c3, c4].map(c => once(c, 'gameStarted'));
         c1.emit('startGame');
-        const [g1, g2, g3, g4] = await Promise.all(started);
+        const [g1, g2, , g4] = await Promise.all(started);
 
         const truth = g1.board; // لوحة القائد الأحمر = الحقيقة الكاملة
         if (truth.filter(c => c.type).length !== 25) fail('القائد لا يرى كل الألوان');
+        if (g1.turnEndsAt !== null) fail('مؤقّت يعمل رغم تعطيله');
         assertSanitized(g2.board, 'المخمن الأحمر');
         assertSanitized(g4.board, 'المخمن الأزرق');
 
@@ -118,17 +168,14 @@ const main = async () => {
         const spyB = teamA === 'RED' ? c3 : c1;
         const guessA = teamA === 'RED' ? c2 : c4;
         const guessB = teamA === 'RED' ? c4 : c2;
-        const idx = (type, exclude = []) => truth.findIndex((c, i) => c.type === type && !c.revealed && !exclude.includes(i));
+        const idx = (type) => truth.findIndex(c => c.type === type && !c.revealed);
         ok(`الفريق البادئ: ${teamA}`);
 
-        // 6) تلميح بكلمة من اللوحة (مع همزة مختلفة) يجب أن يُرفض
-        const boardWord = truth[0].word;
-        spyA.emit('giveClue', { clue: boardWord.replace(/ا/g, 'أ'), count: 1 });
+        // تلميح بكلمة من اللوحة (مع همزة مختلفة) يجب أن يُرفض
+        spyA.emit('giveClue', { clue: truth[0].word.replace(/ا/g, 'أ'), count: 1 });
         await once(spyA, 'clueError');
         ok('رفض تلميح مطابق لكلمة على اللوحة (بعد التطبيع العربي)');
 
-        // التخمين: نكتفي بحدث cardRevealed المطابق للفهرس، وعند توقّع
-        // انتقال دور أو فوز ننتظر gameUpdate المطابق للشرط تحديداً
         const guess = async (socket, cardIndex, updPred = null) => {
             const revP = once(socket, 'cardRevealed', d => d.cardIndex === cardIndex);
             const updP = updPred ? once(socket, 'gameUpdate', updPred) : null;
@@ -144,17 +191,17 @@ const main = async () => {
             await clueP;
         };
 
-        // 7) تلميح صحيح + تخمينات الفريق الأول
+        // تلميح صحيح + تخمينات الفريق الأول
         await clue(spyA, guessA, 'اختبار', 2);
-
-        let res = await guess(guessA, idx(teamA));
+        let res = await guess(guessA, idx(teamA), d => d.history && d.history.length === 1);
         if (res.rev.result !== teamA) fail('نتيجة كشف خاطئة');
-        ok('الفريق الأول خمّن بطاقته بنجاح');
+        if (res.upd.history[0].result !== 'Correct' || res.upd.history[0].word !== res.rev.card.word) fail('سجل التخمينات غير صحيح');
+        ok('الفريق الأول خمّن بطاقته + سجل التخمينات يُبث');
 
         res = await guess(guessA, idx(teamB), d => d.currentTurn === teamB);
         ok('تخمين بطاقة الخصم أنهى الدور');
 
-        // 8) الفريق الثاني يخمّن (كان معطلاً كلياً قبل الإصلاح)
+        // الفريق الثاني يخمّن
         await clue(spyB, guessB, 'تجربة', 1);
         res = await guess(guessB, idx(teamB));
         if (res.rev.result !== teamB) fail('تخمين الفريق الثاني فشل');
@@ -165,10 +212,10 @@ const main = async () => {
         await endP;
         ok('إنهاء الدور يدوياً');
 
-        // 9) إعادة الاتصال أثناء اللعبة بنفس userId
+        // إعادة الاتصال أثناء اللعبة بنفس userId
         const guessAId = teamA === 'RED' ? ids.c2 : ids.c4;
         guessA.disconnect();
-        await new Promise(r => setTimeout(r, 300));
+        await sleep(300);
         const guessA2 = await connect();
         guessA2.emit('joinRoom', { roomCode: ROOM, username: 'عائد', userId: guessAId });
         const rejoin = await once(guessA2, 'roomJoined');
@@ -177,20 +224,114 @@ const main = async () => {
         assertSanitized(gRe.board, 'المخمن العائد');
         ok('إعادة الاتصال أثناء اللعبة استعادت المقعد والحالة');
 
-        // 10) ضرب القاتل → فوز الفريق الآخر ولوحة مكشوفة للجميع
-        await clue(spyA, guessA2, 'نهاية', 1);
-        res = await guess(guessA2, idx('ASSASSIN'), d => !!d.winner);
+        // تبويب ثانٍ بنفس الهوية → التبويب الأول يستلم seatTaken
+        const seatP = once(guessA2, 'seatTaken');
+        const guessA3 = await connect();
+        guessA3.emit('joinRoom', { roomCode: ROOM, username: 'عائد', userId: guessAId });
+        await once(guessA3, 'gameStarted');
+        await seatP;
+        ok('التبويب القديم أُعلم بأن مقعده أُخذ (seatTaken)');
+        guessA2.disconnect();
+
+        // ضرب القاتل → فوز الفريق الآخر ولوحة مكشوفة للجميع
+        await clue(spyA, guessA3, 'نهاية', 1);
+        res = await guess(guessA3, idx('ASSASSIN'), d => !!d.winner);
         if (res.upd.winner !== teamB) fail(`القاتل لم يُفز الفريق الآخر (winner=${res.upd.winner})`);
         if (!res.upd.board || res.upd.board.filter(c => c.type).length !== 25) fail('اللوحة لم تُكشف كاملة عند النهاية');
         ok('القاتل أنهى اللعبة لصالح الخصم وكُشفت اللوحة');
 
-        // 11) العودة للوبي (المضيف فقط) — الانتظار على c3 لأنه لا يُفصل في أي سيناريو
-        const lobbyP = once(c3, 'returnedToLobby');
+        // إعادة اتصال بعد النهاية → يستلم الحالة FINISHED مع الفائز (لا يُرمى لغرفة الانتظار)
+        c3.disconnect();
+        await sleep(200);
+        const c3b = await connect();
+        c3b.emit('joinRoom', { roomCode: ROOM, username: 'سارة', userId: ids.c3 });
+        const finJoin = await once(c3b, 'roomJoined');
+        const finState = await once(c3b, 'gameStarted');
+        if (finJoin.gameState !== 'FINISHED' || finState.gameState !== 'FINISHED' || finState.winner !== teamB) fail('إعادة الاتصال بعد النهاية لم تُرجع حالة FINISHED مع الفائز');
+        ok('إعادة الاتصال بعد النهاية تُرجع شاشة النتيجة');
+
+        // startGame من FINISHED مرفوض — يجب playAgain أولاً
+        c1.emit('startGame');
+        await once(c1, 'gameError');
+        ok('startGame مرفوض في حالة FINISHED');
+
+        // العودة للوبي (المضيف فقط)
+        const lobbyP = once(c3b, 'returnedToLobby');
         c1.emit('playAgain');
         await lobbyP;
         ok('playAgain أعاد الغرفة للوبي');
 
-        [c1, c2, c3, c4, guessA2].forEach(c => c.disconnect());
+        [c1, c2, c3b, c4, guessA3].forEach(c => c.disconnect());
+        await sleep(200);
+
+        // ================= المؤقّت + أخذ مقعد قائد منقطع =================
+        const T = await setupFullRoom('TIMERR', { h: 't-h', g1: 't-g1', s2: 't-s2', g2: 't-g2' });
+        T.h.emit('setTimer', { turnDuration: 1 });
+        await once(T.h, 'roomSettings', s => s.turnDuration === 1);
+
+        const tStarted = once(T.h, 'gameStarted');
+        T.h.emit('startGame');
+        const tGame = await tStarted;
+        if (!tGame.turnEndsAt || tGame.turnEndsAt - tGame.serverNow > 1500) fail('turnEndsAt غير صحيح');
+        const firstTurn = tGame.currentTurn;
+        const toP = once(T.g1, 'turnTimeout', d => d.team === firstTurn);
+        const swP = once(T.g1, 'gameUpdate', d => d.currentTurn !== firstTurn);
+        await toP; await swP;
+        ok('انتهاء المؤقّت نقل الدور للفريق الآخر');
+
+        // مخمّن لا يستطيع أخذ مقعد قائد متصل
+        T.g2.emit('setRole', { team: 'BLUE', role: 'SPYMASTER' });
+        await once(T.g2, 'roleError');
+        // القائد الأزرق ينقطع → المخمن الأزرق يأخذ المقعد ويستلم اللوحة بألوانها
+        T.s2.disconnect();
+        await once(T.g2, 'playerDisconnected', d => d.username === 'S2');
+        const takeoverState = once(T.g2, 'gameStarted');
+        T.g2.emit('setRole', { team: 'BLUE', role: 'SPYMASTER' });
+        await once(T.h, 'spymasterChanged', d => d.team === 'BLUE' && d.username === 'G2');
+        const spyBoard = (await takeoverState).board;
+        if (spyBoard.filter(c => c.type).length !== 25) fail('القائد الجديد لا يرى الألوان');
+        ok('مخمّن أخذ مقعد قائد منقطع واستلم اللوحة كاملة');
+
+        // المضيف ينهي الجولة من منتصف اللعبة
+        const abortP = once(T.g1, 'gameAborted');
+        const lobby2 = once(T.g1, 'returnedToLobby');
+        T.h.emit('abortGame');
+        await abortP; await lobby2;
+        ok('abortGame من المضيف أعاد الجميع للوبي');
+        [T.h, T.g1, T.g2].forEach(c => c.disconnect());
+        await sleep(200);
+
+        // ================= مغادرة قائد بلا زملاء → gameAborted =================
+        const A = await setupFullRoom('ABORTT', { h: 'a-h', g1: 'a-g1', s2: 'a-s2', g2: 'a-g2' });
+        A.h.emit('setTimer', { turnDuration: 0 });
+        await once(A.h, 'roomSettings');
+        const aStart = once(A.h, 'gameStarted');
+        A.h.emit('startGame'); await aStart;
+        // المخمن الأزرق يغادر أولاً، ثم القائد الأزرق → الفريق فارغ → إنهاء
+        A.g2.emit('leaveRoom'); await once(A.h, 'playerLeft', d => d.username === 'G2');
+        const vacantNo = never(A.h, 'gameAborted', 100);
+        await vacantNo;
+        const abort2 = once(A.h, 'gameAborted');
+        A.s2.emit('leaveRoom');
+        await abort2;
+        ok('مغادرة قائد بلا زملاء أنهت الجولة بدل تجميدها');
+        [A.h, A.g1, A.s2, A.g2].forEach(c => c.disconnect());
+        await sleep(200);
+
+        // ================= مغادرة قائد مع زملاء → spymasterVacant (اللعبة تستمر) =================
+        const V = await setupFullRoom('VACANT', { h: 'v-h', g1: 'v-g1', s2: 'v-s2', g2: 'v-g2' });
+        const vStart = once(V.h, 'gameStarted');
+        V.h.emit('startGame'); await vStart;
+        const vacP = once(V.g2, 'spymasterVacant', d => d.team === 'BLUE');
+        V.s2.emit('leaveRoom');
+        await vacP;
+        if (!(await never(V.g2, 'gameAborted', 200))) fail('اللعبة أُنهيت رغم وجود زملاء يمكنهم أخذ المقعد');
+        const vTake = once(V.g2, 'gameStarted');
+        V.g2.emit('setRole', { team: 'BLUE', role: 'SPYMASTER' });
+        await vTake;
+        ok('مغادرة قائد مع زملاء: المقعد شاغر واللعبة مستمرة وزميل أخذه');
+        [V.h, V.g1, V.s2, V.g2].forEach(c => c.disconnect());
+
         console.log('\n🎉 كل اختبارات التكامل نجحت');
     } finally {
         server.kill();

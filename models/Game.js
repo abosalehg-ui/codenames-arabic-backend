@@ -32,10 +32,12 @@ const GameSchema = new mongoose.Schema({
         enum: ['RED', 'BLUE'],
         required: true
     },
+    winner: { type: String, enum: ['RED', 'BLUE', null], default: null }, // الفائز عند النهاية
     clue: { type: String, default: null }, // التلميح الأخير من القائد
     guessesLeft: { type: Number, default: 0 }, // عدد المحاولات المتبقية في هذا الدور
     history: [{ // سجل الكلمات المختارة
         team: String,
+        username: String,
         word: String,
         result: String, // مثلاً: 'Correct', 'Innocent', 'Assassin'
         timestamp: { type: Date, default: Date.now }
@@ -47,7 +49,7 @@ const GameSchema = new mongoose.Schema({
         team: { type: String, enum: ['RED', 'BLUE', null] },
         role: { type: String, enum: ['SPYMASTER', 'GUESSER', null] }
     }],
-    timer: { type: Number, default: 60 } // قيمة المؤقت للدور
+    timer: { type: Number, default: 90 } // مدة الدور بالثواني (0 = بلا مؤقّت)
 }, {
     timestamps: true
 });
