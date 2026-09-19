@@ -4,13 +4,17 @@
  * تخمين الفريقين، إنهاء الدور، إعادة الاتصال أثناء اللعبة، القاتل وإنهاء اللعبة،
  * إعادة الاتصال بعد النهاية (FINISHED)، العودة للوبي (playAgain)،
  * منع المضيف الشبح، حد الغرف، التبويب الثاني (seatTaken)، مؤقّت الدور،
- * أخذ مقعد قائد منقطع، ومغادرة قائد بلا زملاء (gameAborted) وإنهاء المضيف (abortGame).
+ * أخذ مقعد قائد منقطع، ومغادرة قائد بلا زملاء (gameAborted) وإنهاء المضيف (abortGame)،
+ * دورة حياة اللاعب المنقطع بعد الجولة (لا شبح يحجز مقعد القائد)، غياب المضيف،
+ * طرد لاعب، قواعد التلميح (كلمة واحدة، 0، غير محدود)، إعادة ضبط المؤقّت عند التلميح،
+ * انضمام متفرج مخمّناً أثناء اللعبة، وعدّاد الجولات.
  *
  * التشغيل: npm run test:integration
  */
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const { io } = require('socket.io-client');
+const { ALL_WORDS } = require('../controllers/gameSetup');
 
 const PORT = 34567;
 const URL = `http://localhost:${PORT}`;
@@ -77,7 +81,11 @@ const main = async () => {
     // 1) تشغيل الخادم بدون قاعدة بيانات
     const server = spawn('node', ['server.js'], {
         cwd: path.join(__dirname, '..'),
-        env: { ...process.env, PORT: String(PORT), MONGO_URI: '', FRONTEND_URL: '', NODE_ENV: 'test' },
+        env: {
+            ...process.env, PORT: String(PORT), MONGO_URI: '', FRONTEND_URL: '', NODE_ENV: 'test',
+            // مهل قصيرة لاختبار حذف المنقطعين ونقل الاستضافة
+            WAITING_REMOVE_DELAY_MS: '500', GAME_REMOVE_DELAY_MS: '1500'
+        },
         stdio: ['ignore', 'pipe', 'pipe']
     });
     server.stderr.on('data', d => process.stderr.write(`[server] ${d}`));
@@ -238,7 +246,8 @@ const main = async () => {
         res = await guess(guessA3, idx('ASSASSIN'), d => !!d.winner);
         if (res.upd.winner !== teamB) fail(`القاتل لم يُفز الفريق الآخر (winner=${res.upd.winner})`);
         if (!res.upd.board || res.upd.board.filter(c => c.type).length !== 25) fail('اللوحة لم تُكشف كاملة عند النهاية');
-        ok('القاتل أنهى اللعبة لصالح الخصم وكُشفت اللوحة');
+        if (!res.upd.series || res.upd.series[teamB] !== 1 || res.upd.series[teamA] !== 0) fail('عدّاد الجولات لم يُحدَّث');
+        ok('القاتل أنهى اللعبة لصالح الخصم وكُشفت اللوحة + عدّاد الجولات 1-0');
 
         // إعادة اتصال بعد النهاية → يستلم الحالة FINISHED مع الفائز (لا يُرمى لغرفة الانتظار)
         c3.disconnect();
@@ -258,8 +267,9 @@ const main = async () => {
         // العودة للوبي (المضيف فقط)
         const lobbyP = once(c3b, 'returnedToLobby');
         c1.emit('playAgain');
-        await lobbyP;
-        ok('playAgain أعاد الغرفة للوبي');
+        const lobbyData = await lobbyP;
+        if (!lobbyData.series || lobbyData.series[teamB] !== 1) fail('returnedToLobby لا يحمل عدّاد الجولات');
+        ok('playAgain أعاد الغرفة للوبي (مع عدّاد الجولات)');
 
         [c1, c2, c3b, c4, guessA3].forEach(c => c.disconnect());
         await sleep(200);
@@ -331,6 +341,101 @@ const main = async () => {
         await vTake;
         ok('مغادرة قائد مع زملاء: المقعد شاغر واللعبة مستمرة وزميل أخذه');
         [V.h, V.g1, V.s2, V.g2].forEach(c => c.disconnect());
+
+        // ================= لاعب منقطع بعد الجولة لا يبقى شبحاً يحجز مقعد القائد =================
+        const G = await setupFullRoom('GHOSTS', { h: 'g-h', g1: 'g-g1', s2: 'g-s2', g2: 'g-g2' });
+        G.h.emit('setTimer', { turnDuration: 0 }); await once(G.h, 'roomSettings');
+        const gStart = once(G.h, 'gameStarted'); G.h.emit('startGame'); await gStart;
+        G.s2.disconnect(); await once(G.h, 'playerDisconnected', d => d.username === 'S2');
+        const gLobby = once(G.h, 'returnedToLobby'); G.h.emit('abortGame'); await gLobby;
+        const N = await connect();
+        N.emit('joinRoom', { roomCode: 'GHOSTS', username: 'N', userId: 'g-n' }); await once(N, 'roomJoined');
+        const nSeatP = once(N, 'roomUpdate', ps => ps.some(p => p.username === 'N' && p.team === 'BLUE' && p.role === 'SPYMASTER'));
+        N.emit('setRole', { team: 'BLUE', role: 'SPYMASTER' });
+        const seat = await nSeatP;
+        const ghostSpy = seat.find(p => p.username === 'S2');
+        if (ghostSpy && ghostSpy.role === 'SPYMASTER') fail('القائد المنقطع ما زال يحجز المقعد');
+        ok('لاعب جديد أخذ مقعد قائد منقطع في اللوبي (لا شبح يقفل الجولة)');
+        await once(G.h, 'playerLeft', d => d.username === 'S2', 3000);
+        ok('المنقطع حُذف من اللوبي بعد المهلة');
+        const gStart2 = once(N, 'gameStarted'); G.h.emit('startGame'); await gStart2;
+        ok('الجولة التالية بدأت بالقائد الجديد');
+        [G.h, G.g1, G.g2, N].forEach(c => c.disconnect());
+        await sleep(200);
+
+        // ================= المضيف يغلق التبويب أثناء اللعبة → لا تموت الغرفة =================
+        const Hh = await setupFullRoom('HOSTGO', { h: 'x-h', g1: 'x-g1', s2: 'x-s2', g2: 'x-g2' });
+        Hh.h.emit('setTimer', { turnDuration: 0 }); await once(Hh.h, 'roomSettings');
+        const hStart = once(Hh.g1, 'gameStarted'); Hh.h.emit('startGame'); await hStart;
+        // المضيف متصل: غيره ممنوع
+        Hh.g1.emit('abortGame'); await once(Hh.g1, 'gameError');
+        Hh.h.disconnect(); await once(Hh.g1, 'playerDisconnected', d => d.username === 'H');
+        const hLobby = once(Hh.g1, 'returnedToLobby');
+        Hh.g1.emit('abortGame');
+        await hLobby;
+        ok('المضيف غائب → لاعب متصل أنهى الجولة بدلاً منه');
+        const transfer = await once(Hh.g1, 'roomUpdate', ps => !ps.some(p => p.username === 'H') && ps.some(p => p.isHost && !p.disconnected), 3000);
+        ok(`الاستضافة انتقلت إلى لاعب متصل (${transfer.find(p => p.isHost).username}) بعد حذف المضيف المنقطع`);
+        [Hh.g1, Hh.s2, Hh.g2].forEach(c => c.disconnect());
+        await sleep(200);
+
+        // ================= طرد لاعب (المضيف فقط، في اللوبي) =================
+        const K = await setupFullRoom('KICKME', { h: 'k-h', g1: 'k-g1', s2: 'k-s2', g2: 'k-g2' });
+        const kUpd = once(K.h, 'roomUpdate', ps => ps.length === 4);
+        K.g1.emit('setRole', { team: 'RED', role: 'GUESSER' }); // يستدعي roomUpdate جديداً لقراءة المعرّفات
+        const kickedId = (await kUpd).find(p => p.username === 'G2').id;
+        K.g1.emit('kickPlayer', { playerId: kickedId }); await once(K.g1, 'gameError');
+        const kickedP = once(K.g2, 'kicked');
+        const leftK = once(K.h, 'playerLeft', d => d.username === 'G2');
+        K.h.emit('kickPlayer', { playerId: kickedId });
+        await kickedP; await leftK;
+        ok('المضيف طرد لاعباً (المطرود أُعلم، والباقون استلموا playerLeft)، وغير المضيف مُنع');
+        [K.h, K.g1, K.s2, K.g2].forEach(c => c.disconnect());
+        await sleep(200);
+
+        // ================= قواعد التلميح: كلمة واحدة، 0، غير محدود + إعادة ضبط المؤقّت =================
+        const C = await setupFullRoom('CLUESS', { h: 'c-h', g1: 'c-g1', s2: 'c-s2', g2: 'c-g2' });
+        C.h.emit('setTimer', { turnDuration: 3 }); await once(C.h, 'roomSettings', s => s.turnDuration === 3);
+        const cStart = once(C.h, 'gameStarted'); C.h.emit('startGame'); const cGame = await cStart;
+        const cSpy = cGame.currentTurn === 'RED' ? C.h : C.s2;
+        const cSpy2 = cGame.currentTurn === 'RED' ? C.s2 : C.h;
+        const cGuess = cGame.currentTurn === 'RED' ? C.g1 : C.g2;
+        const onBoard = new Set(cGame.board.map(c => c.word));
+        cSpy.emit('giveClue', { clue: 'بحر أحمر', count: 2 });
+        const mw = await once(cSpy, 'clueError');
+        if (!mw.includes('كلمة واحدة')) fail('تلميح متعدد الكلمات لم يُرفض');
+        ok('تلميح من كلمتين مرفوض');
+        const compound = ALL_WORDS.find(w => w.includes(' ') && !onBoard.has(w));
+        await sleep(1200);
+        const cUpd = once(cSpy, 'gameUpdate', d => d.clue === compound);
+        cSpy.emit('giveClue', { clue: compound, count: 'unlimited' });
+        const cu = await cUpd;
+        if (cu.clueCount !== 'unlimited' || cu.guessesLeft !== 25) fail(`غير محدود: clueCount=${cu.clueCount} guessesLeft=${cu.guessesLeft}`);
+        if (!cu.turnEndsAt || cu.turnEndsAt - cu.serverNow < 2500) fail('المؤقّت لم يُعد ضبطه عند التلميح');
+        ok(`كلمة مركّبة من القاموس ("${compound}") مقبولة، "غير محدود" = 25 محاولة، والمؤقّت أُعيد ضبطه`);
+        const swap = once(cGuess, 'gameUpdate', d => d.currentTurn !== cGame.currentTurn);
+        cGuess.emit('endTurn'); await swap;
+        const zUpd = once(cSpy2, 'gameUpdate', d => d.clue === 'صفر');
+        cSpy2.emit('giveClue', { clue: 'صفر', count: 0 });
+        const zu = await zUpd;
+        if (zu.clueCount !== 0 || zu.guessesLeft !== 25) fail(`العدد 0: guessesLeft=${zu.guessesLeft}`);
+        ok('العدد 0 = تخمينات بلا حد');
+        [C.h, C.g1, C.s2, C.g2].forEach(c => c.disconnect());
+        await sleep(200);
+
+        // ================= متفرج بلا فريق ينضم مخمّناً أثناء اللعبة =================
+        const S = await setupFullRoom('SPECTA', { h: 's-h', g1: 's-g1', s2: 's-s2', g2: 's-g2' });
+        const X = await connect();
+        X.emit('joinRoom', { roomCode: 'SPECTA', username: 'X', userId: 's-x' }); await once(X, 'roomJoined');
+        S.h.emit('setTimer', { turnDuration: 0 }); await once(S.h, 'roomSettings');
+        const xStart = once(X, 'gameStarted'); S.h.emit('startGame'); const xGame = await xStart;
+        assertSanitized(xGame.board, 'المتفرج');
+        X.emit('setRole', { team: 'RED', role: 'SPYMASTER' }); await once(X, 'roleError');
+        const xJoin = once(S.h, 'roomUpdate', ps => ps.some(p => p.username === 'X' && p.team === 'RED' && p.role === 'GUESSER'));
+        X.emit('setRole', { team: 'RED', role: 'GUESSER' });
+        await xJoin; await once(X, 'gameStarted');
+        ok('المتفرج انضم مخمّناً أثناء اللعبة (ومُنع من القيادة)');
+        [S.h, S.g1, S.s2, S.g2, X].forEach(c => c.disconnect());
 
         console.log('\n🎉 كل اختبارات التكامل نجحت');
     } finally {

@@ -36,17 +36,27 @@ const io = new Server(httpServer, {
     cors: {
         origin: corsOrigin,
         methods: ['GET', 'POST']
-    }
+    },
+    // أكبر حدث شرعي (تلميح 30 حرفاً + عدد) بضع مئات البايتات؛ الافتراضي 1MB
+    maxHttpBufferSize: 10 * 1024
 });
 
 // 3. Middlewares
 app.disable('x-powered-by');
+// خلف وكيل Render نثق بقفزة واحدة فقط: req.ip = العنوان الذي أضافه الوكيل، لا ما يكتبه العميل
+// في X-Forwarded-For. TRUST_PROXY=true/false يتجاوز الافتراضي (الإنتاج = true).
+const trustProxy = process.env.TRUST_PROXY ? process.env.TRUST_PROXY === 'true' : isProduction;
+app.set('trust proxy', trustProxy ? 1 : false);
 app.use(express.json({ limit: '10kb' }));
 app.use(cors({ origin: corsOrigin }));
 
 // 4. مسارات API
 // نظام المستخدمين غير مستخدم من الواجهة حالياً، فلا يُفتح على الإنتاج إلا بطلب صريح
 if (process.env.ENABLE_AUTH_API === 'true') {
+    const secret = process.env.JWT_SECRET || '';
+    if (secret.length < 32 || secret.startsWith('change-me')) {
+        throw new Error('ENABLE_AUTH_API=true يتطلب JWT_SECRET عشوائياً بطول 32 حرفاً على الأقل (openssl rand -base64 48).');
+    }
     app.use('/api/users', userRoutes);
     console.log('🔐 Auth API enabled at /api/users');
 }

@@ -14,8 +14,9 @@ const rateLimit = ({ windowMs, max, message }) => {
     cleanup.unref();
 
     return (req, res, next) => {
-        const forwarded = req.headers['x-forwarded-for'];
-        const ip = (typeof forwarded === 'string' && forwarded.split(',')[0].trim()) || req.ip || 'unknown';
+        // req.ip يحترم إعداد trust proxy في server.js (آخر قفزة موثوقة فقط) —
+        // قراءة X-Forwarded-For مباشرة كانت تثق بأول عنصر وهو ما يكتبه العميل بنفسه
+        const ip = req.ip || 'unknown';
         const now = Date.now();
 
         let entry = hits.get(ip);
