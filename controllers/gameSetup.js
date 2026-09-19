@@ -5,6 +5,11 @@ const wordsData = require('../words.json');
 // فوق تنظيف words.json نفسه — الكلمة المكررة تعني بطاقتين متطابقتين على اللوحة)
 const ALL_WORDS = [...new Set(Object.values(wordsData).flat())];
 
+// الكلمات المركّبة في القاموس ("أسد البحر") تُعدّ كلمة واحدة — تُستثنى من قاعدة
+// "التلميح كلمة واحدة" عند مقارنتها بصيغتها الموحّدة
+const { normalizeArabic } = require('../utils/wordNormalizer');
+const COMPOUND_WORDS = new Set(ALL_WORDS.filter(w => /\s/.test(w)).map(normalizeArabic));
+
 if (ALL_WORDS.length < 25) {
     throw new Error(`words.json يحتوي ${ALL_WORDS.length} كلمة فقط — المطلوب 25 على الأقل`);
 }
@@ -59,4 +64,4 @@ const initializeGameBoard = () => {
     };
 };
 
-module.exports = { initializeGameBoard, shuffle, ALL_WORDS };
+module.exports = { initializeGameBoard, shuffle, ALL_WORDS, COMPOUND_WORDS };

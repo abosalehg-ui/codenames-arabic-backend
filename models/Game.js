@@ -44,7 +44,7 @@ const GameSchema = new mongoose.Schema({
     }],
     players: [{ // قائمة اللاعبين داخل الغرفة
         socketId: String,
-        userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        userId: String, // هوية إعادة الاتصال من العميل — لا علاقة لها بنموذج User
         username: String,
         team: { type: String, enum: ['RED', 'BLUE', null] },
         role: { type: String, enum: ['SPYMASTER', 'GUESSER', null] }

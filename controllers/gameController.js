@@ -1,6 +1,6 @@
 const crypto = require('node:crypto');
 const Game = require('../models/Game');
-const { initializeGameBoard } = require('./gameSetup');
+const { initializeGameBoard, COMPOUND_WORDS } = require('./gameSetup');
 const { countRemaining, checkWinCondition, sanitizeBoardForRole } = require('./gameLogic');
 const { normalizeArabic } = require('../utils/wordNormalizer');
 
@@ -21,11 +21,20 @@ const MAX_CLUE_LENGTH = 30;
 const MAX_HISTORY = 50;
 const DEFAULT_TURN_DURATION = 90;          // ثانية — 0 تعني بلا مؤقّت
 const MAX_TURN_DURATION = 300;
-const WAITING_REMOVE_DELAY = 30 * 1000;    // مهلة حذف اللاعب المنقطع في غرفة الانتظار
+// مهل حذف اللاعب المنقطع — قابلة للتقصير من البيئة لتسريع الاختبارات
+const WAITING_REMOVE_DELAY = Number(process.env.WAITING_REMOVE_DELAY_MS) || 30 * 1000;      // في غرفة الانتظار
+const GAME_REMOVE_DELAY = Number(process.env.GAME_REMOVE_DELAY_MS) || 5 * 60 * 1000;        // أثناء اللعبة وبعدها
 const WAITING_IDLE_TIMEOUT = 15 * 60 * 1000;   // غرفة انتظار خاملة تُحذف بعد 15 دقيقة
 const ROOM_IDLE_TIMEOUT = 2 * 60 * 60 * 1000;  // غرفة فيها لعبة خاملة تُحذف بعد ساعتين
 
+// خلف وكيل عكسي (Render) يُلحق الوكيل عنوان العميل الحقيقي في آخر X-Forwarded-For؛
+// بدون وكيل الترويسة كلها من العميل ولا يُوثق بها
+const TRUST_PROXY = process.env.TRUST_PROXY
+    ? process.env.TRUST_PROXY === 'true'
+    : process.env.NODE_ENV === 'production';
+
 const TEAM_AR = { RED: 'الأحمر', BLUE: 'الأزرق' };
+const UNLIMITED = 'unlimited';
 
 // ====================================
 // دوال مساعدة
@@ -39,10 +48,20 @@ const isHost = (room, player) => player && room && room.hostUserId === player.us
 const touch = (room) => { if (room) room.lastActivity = Date.now(); };
 const otherTeam = (team) => team === 'RED' ? 'BLUE' : 'RED';
 
-// عنوان العميل خلف وكيل عكسي (Render) يأتي في X-Forwarded-For
+// المضيف غائب (منقطع أو غير موجود) → أي لاعب متصل يستطيع إدارة الجولة
+// حتى لا تموت الغرفة إذا أغلق المضيف التبويب
+const hostAbsent = (room) => {
+    const host = room.players.find(p => p.userId === room.hostUserId);
+    return !host || host.disconnected;
+};
+const canManage = (room, player) => isHost(room, player) || (player && !player.disconnected && hostAbsent(room));
+
 const clientIp = (socket) => {
     const fwd = socket.handshake.headers['x-forwarded-for'];
-    if (typeof fwd === 'string' && fwd.length) return fwd.split(',')[0].trim();
+    if (TRUST_PROXY && typeof fwd === 'string' && fwd.length) {
+        const parts = fwd.split(',').map(s => s.trim()).filter(Boolean);
+        if (parts.length) return parts[parts.length - 1];
+    }
     return socket.handshake.address || 'unknown';
 };
 
@@ -77,6 +96,16 @@ const publicPlayers = (room) => room.players.map(p => ({
 }));
 
 const roomSettings = (room) => ({ turnDuration: room.turnDuration });
+const roomSeries = (room) => ({ ...room.series });
+
+// حمولة الغرفة المشتركة (إنشاء/انضمام/عودة للوبي)
+const roomPayload = (room) => ({
+    code: room.code,
+    players: publicPlayers(room),
+    gameState: room.gameState,
+    settings: roomSettings(room),
+    series: roomSeries(room)
+});
 
 // حد بسيط لمعدل الأحداث لكل اتصال (30 حدثاً / 5 ثوانٍ)
 const allowEvent = (socket) => {
@@ -117,9 +146,21 @@ const finishGame = (room, winner) => {
     room.clue = null;
     room.clueCount = 0;
     room.guessesLeft = 0;
+    room.series[winner] += 1;
 };
 
-const resetToLobby = (room) => {
+// جدولة حذف لاعب منقطع — تُستدعى عند الانقطاع وعند العودة للوبي (بمهلة أقصر)
+const scheduleRemoval = (io, room, player, delay) => {
+    if (player.removalTimer) clearTimeout(player.removalTimer);
+    player.removalTimer = setTimeout(() => {
+        player.removalTimer = null;
+        if (player.disconnected && activeRooms[room.code] === room) {
+            removePlayerFromRoom(io, room, player.id);
+        }
+    }, delay);
+};
+
+const resetToLobby = (io, room) => {
     clearTurnTimer(room);
     room.gameState = 'WAITING';
     room.board = [];
@@ -131,6 +172,8 @@ const resetToLobby = (room) => {
     room.winner = null;
     room.history = [];
     room.currentGameId = null;
+    // من انقطع أثناء اللعبة ولم يعد: مهلة اللوبي القصيرة بدل بقائه شبحاً يحجز مقعده
+    room.players.forEach(p => { if (p.disconnected) scheduleRemoval(io, room, p, WAITING_REMOVE_DELAY); });
 };
 
 const deleteRoom = (room, reason) => {
@@ -151,6 +194,7 @@ const gameUpdatePayload = (room, extra = {}) => ({
     turnDuration: room.turnDuration,
     serverNow: Date.now(),
     history: room.history,
+    series: roomSeries(room),
     ...countRemaining(room.board),
     ...extra
 });
@@ -166,7 +210,8 @@ const emitGameStateTo = (io, room, player) => {
     });
 };
 
-// المؤقّت يغطي الدور كاملاً (تفكير القائد + التخمين)؛ انتهاؤه ينقل الدور للفريق الآخر
+// المؤقّت يغطي مرحلة القائد (التفكير بالتلميح)، ثم يُعاد ضبطه عند إعطاء التلميح
+// ليغطي مرحلة التخمين كاملة؛ انتهاؤه في أي مرحلة ينقل الدور للفريق الآخر
 const startTurnTimer = (io, room) => {
     clearTurnTimer(room);
     if (!room.turnDuration || room.gameState !== 'IN_PROGRESS') return;
@@ -188,17 +233,21 @@ const startTurnTimer = (io, room) => {
     }, room.turnDuration * 1000);
 };
 
-// إنهاء الجولة قسراً والعودة للوبي (مغادرة قائد بلا بديل، أو قرار المضيف)
-const abortGame = (io, room, reason) => {
-    persistRoom(room, { gameState: 'FINISHED' });
-    resetToLobby(room);
-    console.log(`🛑 Game aborted in ${room.code}: ${reason}`);
-    io.to(room.code).emit('gameAborted', { reason });
-    io.to(room.code).emit('returnedToLobby', { players: publicPlayers(room), settings: roomSettings(room) });
+const emitReturnedToLobby = (io, room) => {
+    io.to(room.code).emit('returnedToLobby', roomPayload(room));
     io.to(room.code).emit('roomUpdate', publicPlayers(room));
 };
 
-// إزالة لاعب نهائياً من الغرفة (مغادرة صريحة أو انتهاء مهلة الانقطاع)
+// إنهاء الجولة قسراً والعودة للوبي (مغادرة قائد بلا بديل، أو قرار المضيف)
+const abortGame = (io, room, reason) => {
+    persistRoom(room, { gameState: 'FINISHED' });
+    resetToLobby(io, room);
+    console.log(`🛑 Game aborted in ${room.code}: ${reason}`);
+    io.to(room.code).emit('gameAborted', { reason });
+    emitReturnedToLobby(io, room);
+};
+
+// إزالة لاعب نهائياً من الغرفة (مغادرة صريحة أو انتهاء مهلة الانقطاع أو طرد)
 const removePlayerFromRoom = (io, room, socketId) => {
     const player = getPlayer(room, socketId);
     if (!player) return;
@@ -211,9 +260,11 @@ const removePlayerFromRoom = (io, room, socketId) => {
         return;
     }
 
-    // نقل الاستضافة إذا غادر المضيف
+    // نقل الاستضافة إذا غادر المضيف — إلى لاعب متصل، لا إلى منقطع قد لا يعود
     if (room.hostUserId === player.userId) {
-        room.hostUserId = room.players[0].userId;
+        const next = room.players.find(p => !p.disconnected) || room.players[0];
+        room.hostUserId = next.userId;
+        console.log(`⭐ Host of ${room.code} transferred to ${next.username}`);
     }
 
     io.to(room.code).emit('roomUpdate', publicPlayers(room));
@@ -256,6 +307,16 @@ const newPlayer = (socket, username, userId) => ({
     removalTimer: null
 });
 
+// مقعد القائد "محجوز" فقط إذا كان صاحبه متصلاً؛ القائد المنقطع يعود مخمّناً
+const takeSpymasterSeat = (room, team, player) => {
+    const currentSpy = room.players.find(p => p.team === team && p.role === 'SPYMASTER' && p.id !== player.id);
+    if (currentSpy && !currentSpy.disconnected) return currentSpy;
+    if (currentSpy) currentSpy.role = 'GUESSER';
+    player.team = team;
+    player.role = 'SPYMASTER';
+    return null;
+};
+
 // ====================================
 // معالج الاتصالات الرئيسي
 // ====================================
@@ -275,6 +336,29 @@ const handleSocketConnections = (io) => {
 
     io.on('connection', (socket) => {
         console.log('🟢 New connection:', socket.id);
+
+        // غلاف موحّد لأحداث "داخل الغرفة": حد المعدل، الغرفة، الحالة، اللاعب، الصلاحية، الأخطاء
+        // opts: { states, stateError, manage, hostError, errorEvent, errorMessage }
+        const on = (event, opts, fn) => socket.on(event, (data = {}) => {
+            if (!allowEvent(socket)) return;
+            try {
+                const room = getRoom(socket.roomCode);
+                if (!room) return;
+                if (opts.states && !opts.states.includes(room.gameState)) {
+                    if (opts.stateError) socket.emit('gameError', opts.stateError);
+                    return;
+                }
+                const player = getPlayer(room, socket.id);
+                if (!player) return;
+                if (opts.host && !isHost(room, player)) { socket.emit('gameError', opts.hostError); return; }
+                if (opts.manage && !canManage(room, player)) { socket.emit('gameError', opts.hostError); return; }
+                touch(room);
+                fn(room, player, data);
+            } catch (error) {
+                console.error(`❌ Error on ${event}:`, error);
+                if (opts.errorEvent) socket.emit(opts.errorEvent, opts.errorMessage);
+            }
+        });
 
         // ====================================
         // CREATE ROOM
@@ -324,6 +408,7 @@ const handleSocketConnections = (io) => {
                     guessesLeft: 0,
                     winner: null,
                     history: [],
+                    series: { RED: 0, BLUE: 0 },
                     turnDuration: DEFAULT_TURN_DURATION,
                     turnTimer: null,
                     turnEndsAt: null,
@@ -334,7 +419,7 @@ const handleSocketConnections = (io) => {
                 activeRooms[roomCode] = room;
 
                 console.log(`✅ Room created: ${roomCode} by ${username}`);
-                socket.emit('roomCreated', { code: roomCode, players: publicPlayers(room), settings: roomSettings(room) });
+                socket.emit('roomCreated', roomPayload(room));
                 io.to(roomCode).emit('roomUpdate', publicPlayers(room));
 
             } catch (error) {
@@ -388,12 +473,7 @@ const handleSocketConnections = (io) => {
                     socket.join(room.code);
                     socket.roomCode = room.code;
 
-                    socket.emit('roomJoined', {
-                        code: room.code,
-                        players: publicPlayers(room),
-                        gameState: room.gameState,
-                        settings: roomSettings(room)
-                    });
+                    socket.emit('roomJoined', roomPayload(room));
                     // الحالة الكاملة تُرسل أثناء اللعبة وبعد نهايتها (شاشة النتيجة) على السواء
                     if (room.gameState !== 'WAITING') {
                         emitGameStateTo(io, room, existing);
@@ -422,12 +502,7 @@ const handleSocketConnections = (io) => {
                 room.players.push(newPlayer(socket, username, userId));
 
                 console.log(`✅ ${username} joined room: ${room.code}`);
-                socket.emit('roomJoined', {
-                    code: room.code,
-                    players: publicPlayers(room),
-                    gameState: room.gameState,
-                    settings: roomSettings(room)
-                });
+                socket.emit('roomJoined', roomPayload(room));
                 io.to(room.code).emit('roomUpdate', publicPlayers(room));
 
             } catch (error) {
@@ -439,401 +514,333 @@ const handleSocketConnections = (io) => {
         // ====================================
         // SET ROLE
         // ====================================
-        socket.on('setRole', (data = {}) => {
-            if (!allowEvent(socket)) return;
-            try {
-                const room = getRoom(socket.roomCode);
-                if (!room) return;
-                touch(room);
+        on('setRole', { errorEvent: 'roleError', errorMessage: 'فشل تعيين الدور.' }, (room, player, data) => {
+            const { team, role } = data;
+            if (!['RED', 'BLUE'].includes(team) || !['SPYMASTER', 'GUESSER'].includes(role)) {
+                socket.emit('roleError', 'اختيار غير صالح.');
+                return;
+            }
 
-                const { team, role } = data;
-                if (!['RED', 'BLUE'].includes(team) || !['SPYMASTER', 'GUESSER'].includes(role)) {
-                    socket.emit('roleError', 'اختيار غير صالح.');
-                    return;
-                }
-
-                const player = getPlayer(room, socket.id);
-                if (!player) return;
-
-                // أثناء اللعبة: التغيير الوحيد المسموح هو أخذ مقعد قائد فريقك إن كان شاغراً
-                // أو صاحبه منقطعاً — حتى لا تتجمّد اللعبة على قائد غائب
-                if (room.gameState === 'IN_PROGRESS') {
-                    if (role !== 'SPYMASTER' || team !== player.team || player.role !== 'GUESSER') {
-                        socket.emit('roleError', 'أثناء اللعبة يمكن فقط أخذ مقعد قائد فريقك إذا كان شاغراً.');
+            if (room.gameState === 'IN_PROGRESS') {
+                // متفرج بلا فريق: ينضم مخمّناً لأي فريق (لا يستلم ألواناً فلا تسريب)
+                if (!player.team) {
+                    if (role !== 'GUESSER') {
+                        socket.emit('roleError', 'أثناء اللعبة يمكنك الانضمام مخمّناً فقط.');
                         return;
                     }
-                    const currentSpy = room.players.find(p => p.team === team && p.role === 'SPYMASTER');
-                    if (currentSpy && !currentSpy.disconnected) {
-                        socket.emit('roleError', 'قائد فريقك موجود ومتصل.');
-                        return;
-                    }
-                    if (currentSpy) currentSpy.role = 'GUESSER'; // القائد المنقطع يعود مخمّناً عند عودته
-                    player.role = 'SPYMASTER';
-
-                    console.log(`👑 ${player.username} took over as ${team} spymaster in ${room.code}`);
+                    player.team = team;
+                    player.role = 'GUESSER';
+                    console.log(`👀 ${player.username} joined ${team} as guesser mid-game in ${room.code}`);
                     io.to(room.code).emit('roomUpdate', publicPlayers(room));
-                    io.to(room.code).emit('spymasterChanged', { team, username: player.username });
-                    // القائد الجديد يستلم اللوحة بألوانها؛ والقديم (إن عاد) يستلم نسخة المخمّن
                     emitGameStateTo(io, room, player);
-                    if (currentSpy) emitGameStateTo(io, room, currentSpy);
                     return;
                 }
 
-                if (room.gameState === 'FINISHED') {
-                    socket.emit('roleError', 'انتظر عودة المضيف إلى غرفة الانتظار لتغيير الدور.');
+                // غير ذلك: التغيير الوحيد المسموح هو أخذ مقعد قائد فريقك إن كان شاغراً
+                // أو صاحبه منقطعاً — حتى لا تتجمّد اللعبة على قائد غائب
+                if (role !== 'SPYMASTER' || team !== player.team || player.role !== 'GUESSER') {
+                    socket.emit('roleError', 'أثناء اللعبة يمكن فقط أخذ مقعد قائد فريقك إذا كان شاغراً.');
                     return;
                 }
-
-                if (role === 'SPYMASTER') {
-                    const isRoleTaken = room.players.some(p =>
-                        p.team === team && p.role === 'SPYMASTER' && p.id !== socket.id
-                    );
-                    if (isRoleTaken) {
-                        socket.emit('roleError', `فريق ${TEAM_AR[team]} لديه قائد بالفعل.`);
-                        return;
-                    }
+                const currentSpy = room.players.find(p => p.team === team && p.role === 'SPYMASTER');
+                if (currentSpy && !currentSpy.disconnected) {
+                    socket.emit('roleError', 'قائد فريقك موجود ومتصل.');
+                    return;
                 }
+                if (currentSpy) currentSpy.role = 'GUESSER'; // القائد المنقطع يعود مخمّناً عند عودته
+                player.role = 'SPYMASTER';
 
+                console.log(`👑 ${player.username} took over as ${team} spymaster in ${room.code}`);
+                io.to(room.code).emit('roomUpdate', publicPlayers(room));
+                io.to(room.code).emit('spymasterChanged', { team, username: player.username });
+                // القائد الجديد يستلم اللوحة بألوانها؛ والقديم (إن عاد) يستلم نسخة المخمّن
+                emitGameStateTo(io, room, player);
+                if (currentSpy) emitGameStateTo(io, room, currentSpy);
+                return;
+            }
+
+            if (room.gameState === 'FINISHED') {
+                socket.emit('roleError', 'انتظر عودة المضيف إلى غرفة الانتظار لتغيير الدور.');
+                return;
+            }
+
+            if (role === 'SPYMASTER') {
+                const holder = takeSpymasterSeat(room, team, player);
+                if (holder) {
+                    socket.emit('roleError', `فريق ${TEAM_AR[team]} لديه قائد بالفعل.`);
+                    return;
+                }
+            } else {
                 player.team = team;
                 player.role = role;
-                console.log(`✅ ${player.username} set role: ${team} ${role}`);
-                io.to(room.code).emit('roomUpdate', publicPlayers(room));
-
-            } catch (error) {
-                console.error('❌ Error setting role:', error);
-                socket.emit('roleError', 'فشل تعيين الدور.');
             }
+            console.log(`✅ ${player.username} set role: ${team} ${role}`);
+            io.to(room.code).emit('roomUpdate', publicPlayers(room));
         });
 
         // ====================================
         // SET TIMER (المضيف فقط — في غرفة الانتظار)
         // ====================================
-        socket.on('setTimer', (data = {}) => {
-            if (!allowEvent(socket)) return;
-            try {
-                const room = getRoom(socket.roomCode);
-                if (!room || room.gameState !== 'WAITING') return;
-                touch(room);
-
-                const player = getPlayer(room, socket.id);
-                if (!isHost(room, player)) {
-                    socket.emit('gameError', 'المضيف فقط يمكنه تغيير إعدادات الغرفة.');
-                    return;
-                }
-
-                const seconds = data.turnDuration;
-                if (!Number.isInteger(seconds) || seconds < 0 || seconds > MAX_TURN_DURATION) {
-                    socket.emit('gameError', `مدة الدور يجب أن تكون بين 0 (بلا مؤقّت) و ${MAX_TURN_DURATION} ثانية.`);
-                    return;
-                }
-
-                room.turnDuration = seconds;
-                console.log(`⏱️ Turn duration set to ${seconds}s in ${room.code}`);
-                io.to(room.code).emit('roomSettings', roomSettings(room));
-
-            } catch (error) {
-                console.error('❌ Error setting timer:', error);
+        on('setTimer', { states: ['WAITING'], host: true, hostError: 'المضيف فقط يمكنه تغيير إعدادات الغرفة.' }, (room, player, data) => {
+            const seconds = data.turnDuration;
+            if (!Number.isInteger(seconds) || seconds < 0 || seconds > MAX_TURN_DURATION) {
+                socket.emit('gameError', `مدة الدور يجب أن تكون بين 0 (بلا مؤقّت) و ${MAX_TURN_DURATION} ثانية.`);
+                return;
             }
+            room.turnDuration = seconds;
+            console.log(`⏱️ Turn duration set to ${seconds}s in ${room.code}`);
+            io.to(room.code).emit('roomSettings', roomSettings(room));
+        });
+
+        // ====================================
+        // KICK PLAYER (المضيف فقط — في غرفة الانتظار)
+        // ====================================
+        on('kickPlayer', { states: ['WAITING'], host: true, hostError: 'المضيف فقط يمكنه إخراج لاعب.' }, (room, player, data) => {
+            const target = typeof data.playerId === 'string' ? getPlayer(room, data.playerId) : null;
+            if (!target || target.id === socket.id) {
+                socket.emit('gameError', 'اللاعب غير موجود.');
+                return;
+            }
+            const targetSocket = io.sockets.sockets.get(target.id);
+            if (targetSocket) {
+                targetSocket.emit('kicked', 'أخرجك المضيف من الغرفة.');
+                targetSocket.leave(room.code);
+                targetSocket.roomCode = null;
+            }
+            console.log(`🚪 ${target.username} kicked from ${room.code} by ${player.username}`);
+            removePlayerFromRoom(io, room, target.id);
         });
 
         // ====================================
         // START GAME (المضيف فقط — من غرفة الانتظار)
         // ====================================
-        socket.on('startGame', () => {
-            if (!allowEvent(socket)) return;
-            try {
-                const room = getRoom(socket.roomCode);
-                if (!room) return;
-                if (room.gameState !== 'WAITING') {
-                    socket.emit('gameError', 'الغرفة ليست في وضع الانتظار.');
-                    return;
-                }
-                touch(room);
-
-                const player = getPlayer(room, socket.id);
-                if (!isHost(room, player)) {
-                    socket.emit('gameError', 'المضيف فقط يمكنه بدء اللعبة.');
-                    return;
-                }
-
-                const has = (team, role) => room.players.some(p => p.team === team && p.role === role && !p.disconnected);
-                if (!has('RED', 'SPYMASTER') || !has('BLUE', 'SPYMASTER')) {
-                    socket.emit('gameError', 'يجب أن يكون هناك قائد أحمر وقائد أزرق لبدء اللعبة.');
-                    return;
-                }
-                if (!has('RED', 'GUESSER') || !has('BLUE', 'GUESSER')) {
-                    socket.emit('gameError', 'يجب أن يكون لكل فريق مخمن واحد على الأقل.');
-                    return;
-                }
-
-                // الحالة في الذاكرة هي المصدر الأساسي
-                const gameData = initializeGameBoard();
-                room.gameState = 'IN_PROGRESS';
-                room.board = gameData.board;
-                room.currentTurn = gameData.currentTurn;
-                room.firstTeam = gameData.firstTeam;
-                room.clue = null;
-                room.clueCount = 0;
-                room.guessesLeft = 0;
-                room.winner = null;
-                room.history = [];
-                room.currentGameId = null;
-                startTurnTimer(io, room);
-
-                console.log(`✅ Game started in room: ${room.code} (timer: ${room.turnDuration}s)`);
-
-                // كل لاعب يستلم نسخة مناسبة لدوره (المخمن لا يرى الألوان)
-                room.players.forEach(p => {
-                    if (!p.disconnected) emitGameStateTo(io, room, p);
-                });
-
-                // الحفظ في القاعدة غير حاجب — فشله لا يمنع اللعبة
-                Game.create({
-                    roomCode: room.code,
-                    board: room.board,
-                    currentTurn: room.currentTurn,
-                    firstTeam: room.firstTeam,
-                    timer: room.turnDuration,
-                    players: room.players.map(p => ({
-                        socketId: p.id,
-                        userId: null,
-                        username: p.username,
-                        team: p.team,
-                        role: p.role
-                    })),
-                    gameState: 'IN_PROGRESS'
-                }).then(game => {
-                    room.currentGameId = game._id;
-                }).catch(err => {
-                    console.error(`⚠️ DB save failed for game in ${room.code}:`, err.message);
-                });
-
-            } catch (error) {
-                console.error('❌ Error starting game:', error);
-                socket.emit('gameError', 'فشل بدء اللعبة.');
+        on('startGame', {
+            states: ['WAITING'], stateError: 'الغرفة ليست في وضع الانتظار.',
+            host: true, hostError: 'المضيف فقط يمكنه بدء اللعبة.',
+            errorEvent: 'gameError', errorMessage: 'فشل بدء اللعبة.'
+        }, (room) => {
+            const has = (team, role) => room.players.some(p => p.team === team && p.role === role && !p.disconnected);
+            if (!has('RED', 'SPYMASTER') || !has('BLUE', 'SPYMASTER')) {
+                socket.emit('gameError', 'يجب أن يكون هناك قائد أحمر وقائد أزرق لبدء اللعبة.');
+                return;
             }
+            if (!has('RED', 'GUESSER') || !has('BLUE', 'GUESSER')) {
+                socket.emit('gameError', 'يجب أن يكون لكل فريق مخمن واحد على الأقل.');
+                return;
+            }
+
+            // الحالة في الذاكرة هي المصدر الأساسي
+            const gameData = initializeGameBoard();
+            room.gameState = 'IN_PROGRESS';
+            room.board = gameData.board;
+            room.currentTurn = gameData.currentTurn;
+            room.firstTeam = gameData.firstTeam;
+            room.clue = null;
+            room.clueCount = 0;
+            room.guessesLeft = 0;
+            room.winner = null;
+            room.history = [];
+            room.currentGameId = null;
+            // من انقطع في اللوبي ولم يُحذف بعد: يحتفظ بمقعده بمهلة اللعبة الأطول
+            room.players.forEach(p => { if (p.disconnected) scheduleRemoval(io, room, p, GAME_REMOVE_DELAY); });
+            startTurnTimer(io, room);
+
+            console.log(`✅ Game started in room: ${room.code} (timer: ${room.turnDuration}s)`);
+
+            // كل لاعب يستلم نسخة مناسبة لدوره (المخمن لا يرى الألوان)
+            room.players.forEach(p => {
+                if (!p.disconnected) emitGameStateTo(io, room, p);
+            });
+
+            // الحفظ في القاعدة غير حاجب — فشله لا يمنع اللعبة
+            Game.create({
+                roomCode: room.code,
+                board: room.board,
+                currentTurn: room.currentTurn,
+                firstTeam: room.firstTeam,
+                timer: room.turnDuration,
+                players: room.players.map(p => ({
+                    socketId: p.id,
+                    userId: p.userId,
+                    username: p.username,
+                    team: p.team,
+                    role: p.role
+                })),
+                gameState: 'IN_PROGRESS'
+            }).then(game => {
+                room.currentGameId = game._id;
+            }).catch(err => {
+                console.error(`⚠️ DB save failed for game in ${room.code}:`, err.message);
+            });
         });
 
         // ====================================
         // GIVE CLUE
         // ====================================
-        socket.on('giveClue', (data = {}) => {
-            if (!allowEvent(socket)) return;
-            try {
-                const room = getRoom(socket.roomCode);
-                if (!room || room.gameState !== 'IN_PROGRESS') return;
-                touch(room);
+        on('giveClue', { states: ['IN_PROGRESS'], errorEvent: 'clueError', errorMessage: 'فشل إعطاء التلميح.' }, (room, player, data) => {
+            const clue = typeof data.clue === 'string' ? data.clue.trim() : '';
+            // العدد: 0..9، أو "unlimited" (تخمينات بلا حد — القواعد الرسمية)
+            const unlimited = data.count === UNLIMITED;
+            const count = unlimited ? 0 : data.count;
 
-                const player = getPlayer(room, socket.id);
-                const clue = typeof data.clue === 'string' ? data.clue.trim() : '';
-                const count = data.count;
-
-                if (!player || !isSpymaster(player) || !isMyTurn(room, player)) {
-                    socket.emit('clueError', 'ليس دورك أو ليس مسموحاً لك بإعطاء تلميح.');
-                    return;
-                }
-
-                if (room.clue) {
-                    socket.emit('clueError', 'تم إعطاء تلميح لهذا الدور بالفعل.');
-                    return;
-                }
-
-                if (!clue || clue.length > MAX_CLUE_LENGTH || !Number.isInteger(count) || count < 1 || count > 9) {
-                    socket.emit('clueError', `تلميح غير صالح. يرجى إدخال تلميح (${MAX_CLUE_LENGTH} حرفاً كحد أقصى) وعدد بين 1 و 9.`);
-                    return;
-                }
-
-                // منع استخدام كلمة من اللوحة كتلميح — بمقارنة عربية موحّدة
-                // (تتجاهل التشكيل والهمزات) حتى لا يُلتف على المنع
-                const normalizedClue = normalizeArabic(clue);
-                const isClueOnBoard = room.board.some(card =>
-                    !card.revealed && normalizeArabic(card.word) === normalizedClue
-                );
-                if (isClueOnBoard) {
-                    socket.emit('clueError', 'لا يمكن استخدام كلمة موجودة على لوح اللعب كتلميح.');
-                    return;
-                }
-
-                room.clue = clue;
-                room.clueCount = count;
-                room.guessesLeft = count + 1; // +1 للمحاولة الإضافية
-
-                persistRoom(room, { clue, guessesLeft: room.guessesLeft });
-                console.log(`✅ Clue given: "${clue}" (${count}) by ${player.team}`);
-
-                io.to(room.code).emit('clueGiven', { clue, count, team: player.team });
-                io.to(room.code).emit('gameUpdate', gameUpdatePayload(room));
-
-            } catch (error) {
-                console.error('❌ Error giving clue:', error);
-                socket.emit('clueError', 'فشل إعطاء التلميح.');
+            if (!isSpymaster(player) || !isMyTurn(room, player)) {
+                socket.emit('clueError', 'ليس دورك أو ليس مسموحاً لك بإعطاء تلميح.');
+                return;
             }
+
+            if (room.clue) {
+                socket.emit('clueError', 'تم إعطاء تلميح لهذا الدور بالفعل.');
+                return;
+            }
+
+            if (!clue || clue.length > MAX_CLUE_LENGTH || !Number.isInteger(count) || count < 0 || count > 9) {
+                socket.emit('clueError', `تلميح غير صالح. يرجى إدخال تلميح (${MAX_CLUE_LENGTH} حرفاً كحد أقصى) وعدد بين 0 و 9 أو "غير محدود".`);
+                return;
+            }
+
+            const normalizedClue = normalizeArabic(clue);
+
+            // التلميح كلمة واحدة — يُستثنى ما يُعدّ كلمة واحدة في القاموس ("أسد البحر")
+            if (/\s/.test(clue) && !COMPOUND_WORDS.has(normalizedClue)) {
+                socket.emit('clueError', 'التلميح يجب أن يكون كلمة واحدة.');
+                return;
+            }
+
+            // منع استخدام كلمة من اللوحة كتلميح — بمقارنة عربية موحّدة
+            // (تتجاهل التشكيل والهمزات) حتى لا يُلتف على المنع
+            const isClueOnBoard = room.board.some(card =>
+                !card.revealed && normalizeArabic(card.word) === normalizedClue
+            );
+            if (isClueOnBoard) {
+                socket.emit('clueError', 'لا يمكن استخدام كلمة موجودة على لوح اللعب كتلميح.');
+                return;
+            }
+
+            const unrevealed = room.board.filter(c => !c.revealed).length;
+            room.clue = clue;
+            room.clueCount = unlimited ? UNLIMITED : count;
+            // 0 و"غير محدود" = تخمينات حتى الخطأ؛ غير ذلك العدد + محاولة إضافية
+            room.guessesLeft = (unlimited || count === 0) ? unrevealed : count + 1;
+
+            // إعادة ضبط المؤقّت: مرحلة التخمين تأخذ وقتها كاملاً بعد تفكير القائد
+            startTurnTimer(io, room);
+
+            persistRoom(room, { clue, guessesLeft: room.guessesLeft });
+            console.log(`✅ Clue given: "${clue}" (${room.clueCount}) by ${player.team}`);
+
+            io.to(room.code).emit('clueGiven', { clue, count: room.clueCount, team: player.team });
+            io.to(room.code).emit('gameUpdate', gameUpdatePayload(room));
         });
 
         // ====================================
         // MAKE GUESS
         // ====================================
-        socket.on('makeGuess', (data = {}) => {
-            if (!allowEvent(socket)) return;
-            try {
-                const room = getRoom(socket.roomCode);
-                if (!room || room.gameState !== 'IN_PROGRESS') return;
-                touch(room);
+        on('makeGuess', { states: ['IN_PROGRESS'], errorEvent: 'guessError', errorMessage: 'فشل التخمين.' }, (room, player, data) => {
+            const { cardIndex } = data;
 
-                const player = getPlayer(room, socket.id);
-                const { cardIndex } = data;
-
-                if (!player || !isGuesser(player) || !isMyTurn(room, player)) {
-                    socket.emit('guessError', 'ليس دورك أو ليس مسموحاً لك بالتخمين.');
-                    return;
-                }
-
-                if (room.guessesLeft === 0) {
-                    socket.emit('guessError', 'لا توجد محاولات متبقية.');
-                    return;
-                }
-
-                if (!Number.isInteger(cardIndex) || cardIndex < 0 || cardIndex >= room.board.length) {
-                    socket.emit('guessError', 'اختيار غير صالح.');
-                    return;
-                }
-
-                const card = room.board[cardIndex];
-                if (!card || card.revealed) {
-                    socket.emit('guessError', 'اختيار غير صالح.');
-                    return;
-                }
-
-                card.revealed = true;
-                card.pickedBy = player.team;
-                room.guessesLeft -= 1;
-
-                const result = card.type;
-                const turnOver = result !== player.team || room.guessesLeft === 0;
-                const winnerTeam = checkWinCondition(room.board);
-
-                const historyEntry = {
-                    team: player.team,
-                    username: player.username,
-                    word: card.word,
-                    result: result === player.team ? 'Correct'
-                        : result === 'ASSASSIN' ? 'Assassin'
-                        : result === 'INNOCENT' ? 'Innocent' : 'Opponent',
-                    timestamp: Date.now()
-                };
-                room.history.push(historyEntry);
-                if (room.history.length > MAX_HISTORY) room.history.shift();
-
-                if (winnerTeam) {
-                    finishGame(room, winnerTeam);
-                } else if (turnOver) {
-                    switchTurn(room);
-                    startTurnTimer(io, room);
-                }
-
-                persistRoom(room, {
-                    board: room.board,
-                    guessesLeft: room.guessesLeft,
-                    currentTurn: room.currentTurn,
-                    clue: room.clue,
-                    gameState: room.gameState,
-                    winner: room.winner,
-                    $push: { history: historyEntry }
-                });
-
-                console.log(`✅ Card revealed: ${card.word} (${result}) by ${player.team}`);
-
-                io.to(room.code).emit('cardRevealed', {
-                    cardIndex,
-                    card,
-                    result,
-                    ...countRemaining(room.board)
-                });
-
-                io.to(room.code).emit('gameUpdate', gameUpdatePayload(room, {
-                    // عند نهاية اللعبة فقط تُكشف اللوحة كاملة للجميع
-                    board: winnerTeam ? room.board : undefined
-                }));
-
-            } catch (error) {
-                console.error('❌ Error making guess:', error);
-                socket.emit('guessError', 'فشل التخمين.');
+            if (!isGuesser(player) || !isMyTurn(room, player)) {
+                socket.emit('guessError', 'ليس دورك أو ليس مسموحاً لك بالتخمين.');
+                return;
             }
+
+            if (room.guessesLeft === 0) {
+                socket.emit('guessError', 'لا توجد محاولات متبقية.');
+                return;
+            }
+
+            if (!Number.isInteger(cardIndex) || cardIndex < 0 || cardIndex >= room.board.length) {
+                socket.emit('guessError', 'اختيار غير صالح.');
+                return;
+            }
+
+            const card = room.board[cardIndex];
+            if (!card || card.revealed) {
+                socket.emit('guessError', 'اختيار غير صالح.');
+                return;
+            }
+
+            card.revealed = true;
+            card.pickedBy = player.team;
+            room.guessesLeft -= 1;
+
+            const result = card.type;
+            const turnOver = result !== player.team || room.guessesLeft === 0;
+            const winnerTeam = checkWinCondition(room.board);
+
+            const historyEntry = {
+                team: player.team,
+                username: player.username,
+                word: card.word,
+                result: result === player.team ? 'Correct'
+                    : result === 'ASSASSIN' ? 'Assassin'
+                    : result === 'INNOCENT' ? 'Innocent' : 'Opponent',
+                timestamp: Date.now()
+            };
+            room.history.push(historyEntry);
+            if (room.history.length > MAX_HISTORY) room.history.shift();
+
+            if (winnerTeam) {
+                finishGame(room, winnerTeam);
+            } else if (turnOver) {
+                switchTurn(room);
+                startTurnTimer(io, room);
+            }
+
+            persistRoom(room, {
+                board: room.board,
+                guessesLeft: room.guessesLeft,
+                currentTurn: room.currentTurn,
+                clue: room.clue,
+                gameState: room.gameState,
+                winner: room.winner,
+                $push: { history: historyEntry }
+            });
+
+            console.log(`✅ Card revealed: ${card.word} (${result}) by ${player.team}`);
+
+            io.to(room.code).emit('cardRevealed', {
+                cardIndex,
+                card,
+                result,
+                username: player.username,
+                ...countRemaining(room.board)
+            });
+
+            io.to(room.code).emit('gameUpdate', gameUpdatePayload(room, {
+                // عند نهاية اللعبة فقط تُكشف اللوحة كاملة للجميع
+                board: winnerTeam ? room.board : undefined
+            }));
         });
 
         // ====================================
         // END TURN
         // ====================================
-        socket.on('endTurn', () => {
-            if (!allowEvent(socket)) return;
-            try {
-                const room = getRoom(socket.roomCode);
-                if (!room || room.gameState !== 'IN_PROGRESS') return;
-                touch(room);
+        on('endTurn', { states: ['IN_PROGRESS'] }, (room, player) => {
+            if (!isGuesser(player) || !isMyTurn(room, player)) return;
+            if (!room.clue) return; // لا معنى لإنهاء دور لم يبدأ بتلميح
 
-                const player = getPlayer(room, socket.id);
-                if (!player || !isGuesser(player) || !isMyTurn(room, player)) return;
-                if (!room.clue) return; // لا معنى لإنهاء دور لم يبدأ بتلميح
+            switchTurn(room);
+            startTurnTimer(io, room);
+            persistRoom(room, { currentTurn: room.currentTurn, clue: null, guessesLeft: 0 });
 
-                switchTurn(room);
-                startTurnTimer(io, room);
-                persistRoom(room, { currentTurn: room.currentTurn, clue: null, guessesLeft: 0 });
-
-                console.log(`✅ Turn ended by ${player.team}, now ${room.currentTurn}'s turn`);
-                io.to(room.code).emit('gameUpdate', gameUpdatePayload(room));
-
-            } catch (error) {
-                console.error('❌ Error ending turn:', error);
-            }
+            console.log(`✅ Turn ended by ${player.team}, now ${room.currentTurn}'s turn`);
+            io.to(room.code).emit('gameUpdate', gameUpdatePayload(room));
         });
 
         // ====================================
-        // ABORT GAME (المضيف فقط — في أي وقت أثناء اللعبة أو بعدها)
+        // ABORT GAME (المضيف — أو أي متصل إن كان المضيف غائباً — أثناء اللعبة أو بعدها)
         // ====================================
-        socket.on('abortGame', () => {
-            if (!allowEvent(socket)) return;
-            try {
-                const room = getRoom(socket.roomCode);
-                if (!room || room.gameState === 'WAITING') return;
-                touch(room);
-
-                const player = getPlayer(room, socket.id);
-                if (!isHost(room, player)) {
-                    socket.emit('gameError', 'المضيف فقط يمكنه إنهاء الجولة.');
-                    return;
-                }
-
-                abortGame(io, room, 'أنهى المضيف الجولة وأعاد الجميع إلى غرفة الانتظار.');
-
-            } catch (error) {
-                console.error('❌ Error aborting game:', error);
-            }
+        on('abortGame', { states: ['IN_PROGRESS', 'FINISHED'], manage: true, hostError: 'المضيف فقط يمكنه إنهاء الجولة.' }, (room) => {
+            abortGame(io, room, 'أنهى المضيف الجولة وأعاد الجميع إلى غرفة الانتظار.');
         });
 
         // ====================================
-        // PLAY AGAIN (المضيف فقط — بعد نهاية اللعبة)
+        // PLAY AGAIN (المضيف — أو أي متصل إن كان المضيف غائباً — بعد نهاية اللعبة)
         // ====================================
-        socket.on('playAgain', () => {
-            if (!allowEvent(socket)) return;
-            try {
-                const room = getRoom(socket.roomCode);
-                if (!room || room.gameState !== 'FINISHED') return;
-                touch(room);
-
-                const player = getPlayer(room, socket.id);
-                if (!isHost(room, player)) {
-                    socket.emit('gameError', 'المضيف فقط يمكنه بدء جولة جديدة.');
-                    return;
-                }
-
-                resetToLobby(room);
-                console.log(`🔁 Room ${room.code} returned to lobby`);
-                io.to(room.code).emit('returnedToLobby', { players: publicPlayers(room), settings: roomSettings(room) });
-                io.to(room.code).emit('roomUpdate', publicPlayers(room));
-
-            } catch (error) {
-                console.error('❌ Error on playAgain:', error);
-            }
+        on('playAgain', { states: ['FINISHED'], manage: true, hostError: 'المضيف فقط يمكنه بدء جولة جديدة.' }, (room) => {
+            resetToLobby(io, room);
+            console.log(`🔁 Room ${room.code} returned to lobby`);
+            emitReturnedToLobby(io, room);
         });
 
         // ====================================
@@ -870,15 +877,11 @@ const handleSocketConnections = (io) => {
                 io.to(room.code).emit('roomUpdate', publicPlayers(room));
                 io.to(room.code).emit('playerDisconnected', { username: player.username });
 
-                // أثناء اللعبة نُبقي مقعد اللاعب محجوزاً ليعود بنفس userId (وزملاؤه يستطيعون
-                // أخذ مقعد القائد إن كان هو القائد). في غرفة الانتظار يُحذف بعد مهلة قصيرة.
-                if (room.gameState === 'WAITING') {
-                    player.removalTimer = setTimeout(() => {
-                        if (player.disconnected) {
-                            removePlayerFromRoom(io, room, player.id);
-                        }
-                    }, WAITING_REMOVE_DELAY);
-                }
+                // المقعد محجوز للعودة بنفس userId، لكن بمهلة دائماً: قصيرة في اللوبي، وأطول
+                // أثناء اللعبة (زملاؤه يستطيعون أخذ مقعد القائد في الأثناء). بلا مهلة كان
+                // اللاعب يبقى شبحاً يحجز مقعده ويقفل الجولة التالية.
+                const delay = room.gameState === 'WAITING' ? WAITING_REMOVE_DELAY : GAME_REMOVE_DELAY;
+                scheduleRemoval(io, room, player, delay);
 
             } catch (error) {
                 console.error('❌ Error on disconnect:', error);
@@ -899,4 +902,7 @@ const cleanupTimer = setInterval(() => {
 cleanupTimer.unref();
 
 module.exports = handleSocketConnections;
-module.exports.constants = { MAX_PLAYERS, MAX_ROOMS, MAX_CONNECTIONS_PER_IP, MAX_TURN_DURATION, DEFAULT_TURN_DURATION };
+module.exports.constants = {
+    MAX_PLAYERS, MAX_ROOMS, MAX_CONNECTIONS_PER_IP, MAX_TURN_DURATION, DEFAULT_TURN_DURATION,
+    WAITING_REMOVE_DELAY, GAME_REMOVE_DELAY
+};
