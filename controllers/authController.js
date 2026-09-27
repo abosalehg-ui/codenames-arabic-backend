@@ -1,3 +1,4 @@
+// هيكل مستقبلي غير مستخدم حالياً — انظر التعليق أعلى routes/userRoutes.js
 const User = require('../models/User');
 const generateToken = require('../utils/generateToken');
 

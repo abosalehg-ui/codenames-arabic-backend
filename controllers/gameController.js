@@ -3,8 +3,13 @@ const Game = require('../models/Game');
 const { initializeGameBoard, COMPOUND_WORDS } = require('./gameSetup');
 const { countRemaining, checkWinCondition, sanitizeBoardForRole } = require('./gameLogic');
 const { normalizeArabic } = require('../utils/wordNormalizer');
+const {
+    activeRooms, TEAM_AR, WAITING_REMOVE_DELAY, GAME_REMOVE_DELAY,
+    getRoom, getPlayer, touch, publicPlayers, roomSettings, roomSeries, roomPayload,
+    gameUpdatePayload, persistRoom, clearTurnTimer, switchTurn, scheduleRemoval, resetToLobby,
+    removePlayerFromRoom, startTurnTimer, emitReturnedToLobby, abortGame
+} = require('./roomLifecycle');
 
-const activeRooms = {};
 const connectionsPerIp = new Map();
 
 // ====================================
@@ -15,17 +20,14 @@ const ROOM_CODE_RE = /^[A-Z0-9]{6}$/;
 const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const MAX_PLAYERS = 8;
 const MAX_ROOMS = 500;
-// مجموعة أصدقاء في بيت واحد يشتركون في IP واحد (NAT) — 8 لاعبين × تبويب احتياطي
-const MAX_CONNECTIONS_PER_IP = 20;
+// حد سخي عمداً: شبكات الجوال السعودية (CGNAT) تجمع آلاف المشتركين خلف IP واحد،
+// فحد صارم يرفض عدة مجموعات تلعب من نفس الشبكة بلا ذنب منها. حدود الغرف (500)
+// وأحداث الاتصال الواحد (30/5 ثوانٍ) كافية لمنع إغراق الخادم من سكربت واحد
+const MAX_CONNECTIONS_PER_IP = 150;
 const MAX_CLUE_LENGTH = 30;
 const MAX_HISTORY = 50;
 const DEFAULT_TURN_DURATION = 90;          // ثانية — 0 تعني بلا مؤقّت
 const MAX_TURN_DURATION = 300;
-// مهل حذف اللاعب المنقطع — قابلة للتقصير من البيئة لتسريع الاختبارات
-const WAITING_REMOVE_DELAY = Number(process.env.WAITING_REMOVE_DELAY_MS) || 30 * 1000;      // في غرفة الانتظار
-const GAME_REMOVE_DELAY = Number(process.env.GAME_REMOVE_DELAY_MS) || 5 * 60 * 1000;        // أثناء اللعبة وبعدها
-const WAITING_IDLE_TIMEOUT = 15 * 60 * 1000;   // غرفة انتظار خاملة تُحذف بعد 15 دقيقة
-const ROOM_IDLE_TIMEOUT = 2 * 60 * 60 * 1000;  // غرفة فيها لعبة خاملة تُحذف بعد ساعتين
 
 // خلف وكيل عكسي (Render) يُلحق الوكيل عنوان العميل الحقيقي في آخر X-Forwarded-For؛
 // بدون وكيل الترويسة كلها من العميل ولا يُوثق بها
@@ -33,20 +35,15 @@ const TRUST_PROXY = process.env.TRUST_PROXY
     ? process.env.TRUST_PROXY === 'true'
     : process.env.NODE_ENV === 'production';
 
-const TEAM_AR = { RED: 'الأحمر', BLUE: 'الأزرق' };
 const UNLIMITED = 'unlimited';
 
 // ====================================
 // دوال مساعدة
 // ====================================
-const getRoom = (roomCode) => roomCode ? activeRooms[roomCode.toUpperCase()] : null;
-const getPlayer = (room, socketId) => room ? room.players.find(p => p.id === socketId) : null;
 const isSpymaster = (player) => player && player.role === 'SPYMASTER';
 const isGuesser = (player) => player && player.role === 'GUESSER';
 const isMyTurn = (room, player) => player && room && room.currentTurn === player.team;
 const isHost = (room, player) => player && room && room.hostUserId === player.userId;
-const touch = (room) => { if (room) room.lastActivity = Date.now(); };
-const otherTeam = (team) => team === 'RED' ? 'BLUE' : 'RED';
 
 // المضيف غائب (منقطع أو غير موجود) → أي لاعب متصل يستطيع إدارة الجولة
 // حتى لا تموت الغرفة إذا أغلق المضيف التبويب
@@ -85,28 +82,6 @@ const generateRoomCode = () => {
     return null;
 };
 
-// البيانات العامة للاعبين — لا نبث userId أبداً (يُستخدم لإعادة الاتصال)
-const publicPlayers = (room) => room.players.map(p => ({
-    id: p.id,
-    username: p.username,
-    team: p.team,
-    role: p.role,
-    disconnected: p.disconnected,
-    isHost: p.userId === room.hostUserId
-}));
-
-const roomSettings = (room) => ({ turnDuration: room.turnDuration });
-const roomSeries = (room) => ({ ...room.series });
-
-// حمولة الغرفة المشتركة (إنشاء/انضمام/عودة للوبي)
-const roomPayload = (room) => ({
-    code: room.code,
-    players: publicPlayers(room),
-    gameState: room.gameState,
-    settings: roomSettings(room),
-    series: roomSeries(room)
-});
-
 // حد بسيط لمعدل الأحداث لكل اتصال (30 حدثاً / 5 ثوانٍ)
 const allowEvent = (socket) => {
     const now = Date.now();
@@ -116,88 +91,9 @@ const allowEvent = (socket) => {
     return true;
 };
 
-// حفظ غير حاجب في MongoDB — فشل القاعدة لا يوقف اللعبة أبداً
-const persistRoom = (room, fields) => {
-    if (!room.currentGameId) return;
-    Game.findByIdAndUpdate(room.currentGameId, fields)
-        .catch(err => console.error(`⚠️ DB persist failed for ${room.code}:`, err.message));
-};
-
-// ====================================
-// حالة اللعبة: تبديل الدور، المؤقّت، النهاية، العودة للوبي
-// ====================================
-const clearTurnTimer = (room) => {
-    if (room.turnTimer) clearTimeout(room.turnTimer);
-    room.turnTimer = null;
-    room.turnEndsAt = null;
-};
-
-const switchTurn = (room) => {
-    room.currentTurn = otherTeam(room.currentTurn);
-    room.clue = null;
-    room.clueCount = 0;
-    room.guessesLeft = 0;
-};
-
-const finishGame = (room, winner) => {
-    clearTurnTimer(room);
-    room.gameState = 'FINISHED';
-    room.winner = winner;
-    room.clue = null;
-    room.clueCount = 0;
-    room.guessesLeft = 0;
-    room.series[winner] += 1;
-};
-
-// جدولة حذف لاعب منقطع — تُستدعى عند الانقطاع وعند العودة للوبي (بمهلة أقصر)
-const scheduleRemoval = (io, room, player, delay) => {
-    if (player.removalTimer) clearTimeout(player.removalTimer);
-    player.removalTimer = setTimeout(() => {
-        player.removalTimer = null;
-        if (player.disconnected && activeRooms[room.code] === room) {
-            removePlayerFromRoom(io, room, player.id);
-        }
-    }, delay);
-};
-
-const resetToLobby = (io, room) => {
-    clearTurnTimer(room);
-    room.gameState = 'WAITING';
-    room.board = [];
-    room.currentTurn = null;
-    room.firstTeam = null;
-    room.clue = null;
-    room.clueCount = 0;
-    room.guessesLeft = 0;
-    room.winner = null;
-    room.history = [];
-    room.currentGameId = null;
-    // من انقطع أثناء اللعبة ولم يعد: مهلة اللوبي القصيرة بدل بقائه شبحاً يحجز مقعده
-    room.players.forEach(p => { if (p.disconnected) scheduleRemoval(io, room, p, WAITING_REMOVE_DELAY); });
-};
-
-const deleteRoom = (room, reason) => {
-    clearTurnTimer(room);
-    room.players.forEach(p => { if (p.removalTimer) clearTimeout(p.removalTimer); });
-    delete activeRooms[room.code];
-    console.log(`🗑️ Room ${room.code} deleted (${reason})`);
-};
-
-// الحمولة المشتركة لكل تحديث — serverNow يسمح للعميل بتصحيح فرق الساعة عند العدّ التنازلي
-const gameUpdatePayload = (room, extra = {}) => ({
-    currentTurn: room.currentTurn,
-    clue: room.clue,
-    clueCount: room.clueCount,
-    guessesLeft: room.guessesLeft,
-    winner: room.winner,
-    turnEndsAt: room.turnEndsAt,
-    turnDuration: room.turnDuration,
-    serverNow: Date.now(),
-    history: room.history,
-    series: roomSeries(room),
-    ...countRemaining(room.board),
-    ...extra
-});
+// حمولة بيانات حدث سليمة دائماً (كائن عادي) — بعض العملاء قد يرسلون null صراحة،
+// والقيمة الافتراضية `data = {}` في توقيع الدالة لا تحمي إلا من undefined
+const normalizeData = (data) => (data && typeof data === 'object') ? data : {};
 
 // إرسال حالة اللعبة كاملة للاعب واحد بنسخة مناسبة لدوره
 const emitGameStateTo = (io, room, player) => {
@@ -208,82 +104,6 @@ const emitGameStateTo = (io, room, player) => {
         players: publicPlayers(room),
         ...gameUpdatePayload(room)
     });
-};
-
-// المؤقّت يغطي مرحلة القائد (التفكير بالتلميح)، ثم يُعاد ضبطه عند إعطاء التلميح
-// ليغطي مرحلة التخمين كاملة؛ انتهاؤه في أي مرحلة ينقل الدور للفريق الآخر
-const startTurnTimer = (io, room) => {
-    clearTurnTimer(room);
-    if (!room.turnDuration || room.gameState !== 'IN_PROGRESS') return;
-
-    room.turnEndsAt = Date.now() + room.turnDuration * 1000;
-    room.turnTimer = setTimeout(() => {
-        room.turnTimer = null;
-        if (room.gameState !== 'IN_PROGRESS' || activeRooms[room.code] !== room) return;
-
-        const timedOutTeam = room.currentTurn;
-        switchTurn(room);
-        startTurnTimer(io, room);
-        touch(room);
-        persistRoom(room, { currentTurn: room.currentTurn, clue: null, guessesLeft: 0 });
-
-        console.log(`⏱️ Turn timed out for ${timedOutTeam} in ${room.code}`);
-        io.to(room.code).emit('turnTimeout', { team: timedOutTeam });
-        io.to(room.code).emit('gameUpdate', gameUpdatePayload(room));
-    }, room.turnDuration * 1000);
-};
-
-const emitReturnedToLobby = (io, room) => {
-    io.to(room.code).emit('returnedToLobby', roomPayload(room));
-    io.to(room.code).emit('roomUpdate', publicPlayers(room));
-};
-
-// إنهاء الجولة قسراً والعودة للوبي (مغادرة قائد بلا بديل، أو قرار المضيف)
-const abortGame = (io, room, reason) => {
-    persistRoom(room, { gameState: 'FINISHED' });
-    resetToLobby(io, room);
-    console.log(`🛑 Game aborted in ${room.code}: ${reason}`);
-    io.to(room.code).emit('gameAborted', { reason });
-    emitReturnedToLobby(io, room);
-};
-
-// إزالة لاعب نهائياً من الغرفة (مغادرة صريحة أو انتهاء مهلة الانقطاع أو طرد)
-const removePlayerFromRoom = (io, room, socketId) => {
-    const player = getPlayer(room, socketId);
-    if (!player) return;
-
-    if (player.removalTimer) clearTimeout(player.removalTimer);
-    room.players = room.players.filter(p => p.id !== socketId);
-
-    if (room.players.length === 0) {
-        deleteRoom(room, 'empty');
-        return;
-    }
-
-    // نقل الاستضافة إذا غادر المضيف — إلى لاعب متصل، لا إلى منقطع قد لا يعود
-    if (room.hostUserId === player.userId) {
-        const next = room.players.find(p => !p.disconnected) || room.players[0];
-        room.hostUserId = next.userId;
-        console.log(`⭐ Host of ${room.code} transferred to ${next.username}`);
-    }
-
-    io.to(room.code).emit('roomUpdate', publicPlayers(room));
-    io.to(room.code).emit('playerLeft', { username: player.username });
-    console.log(`👋 ${player.username} left room ${room.code}`);
-
-    // مغادرة قائد أثناء اللعبة: إن بقي له زملاء يستطيع أحدهم أخذ المقعد (setRole)،
-    // وإلا فالفريق لم يعد قابلاً للعب وتعود الغرفة للوبي بدل التجمّد
-    if (room.gameState === 'IN_PROGRESS' && player.role === 'SPYMASTER') {
-        const teammates = room.players.filter(p => p.team === player.team);
-        if (teammates.length === 0) {
-            abortGame(io, room, `غادر قائد الفريق ${TEAM_AR[player.team]} ولم يبقَ في فريقه أحد.`);
-        } else {
-            io.to(room.code).emit('spymasterVacant', {
-                team: player.team,
-                message: `غادر قائد الفريق ${TEAM_AR[player.team]}. يستطيع أحد مخمّني الفريق أخذ دور القائد.`
-            });
-        }
-    }
 };
 
 // إخراج الـ socket من غرفته الحالية إن وُجدت — يمنع "اللاعب الشبح" الذي يبقى مضيفاً
@@ -306,6 +126,16 @@ const newPlayer = (socket, username, userId) => ({
     disconnected: false,
     removalTimer: null
 });
+
+const finishGame = (room, winner) => {
+    clearTurnTimer(room);
+    room.gameState = 'FINISHED';
+    room.winner = winner;
+    room.clue = null;
+    room.clueCount = 0;
+    room.guessesLeft = 0;
+    room.series[winner] += 1;
+};
 
 // مقعد القائد "محجوز" فقط إذا كان صاحبه متصلاً؛ القائد المنقطع يعود مخمّناً
 const takeSpymasterSeat = (room, team, player) => {
@@ -339,8 +169,9 @@ const handleSocketConnections = (io) => {
 
         // غلاف موحّد لأحداث "داخل الغرفة": حد المعدل، الغرفة، الحالة، اللاعب، الصلاحية، الأخطاء
         // opts: { states, stateError, manage, hostError, errorEvent, errorMessage }
-        const on = (event, opts, fn) => socket.on(event, (data = {}) => {
+        const on = (event, opts, fn) => socket.on(event, (data) => {
             if (!allowEvent(socket)) return;
+            data = normalizeData(data);
             try {
                 const room = getRoom(socket.roomCode);
                 if (!room) return;
@@ -363,8 +194,9 @@ const handleSocketConnections = (io) => {
         // ====================================
         // CREATE ROOM
         // ====================================
-        socket.on('createRoom', (data = {}) => {
+        socket.on('createRoom', (data) => {
             if (!allowEvent(socket)) return;
+            data = normalizeData(data);
             try {
                 leaveCurrentRoom(io, socket);
 
@@ -414,7 +246,10 @@ const handleSocketConnections = (io) => {
                     turnEndsAt: null,
                     currentGameId: null,
                     createdAt: Date.now(),
-                    lastActivity: Date.now()
+                    lastActivity: Date.now(),
+                    // من طرده المضيف لا يعود بنفس الهوية أو نفس عنوان الشبكة (انظر kickPlayer)
+                    bannedUserIds: new Set(),
+                    bannedIps: new Set()
                 };
                 activeRooms[roomCode] = room;
 
@@ -431,8 +266,9 @@ const handleSocketConnections = (io) => {
         // ====================================
         // JOIN ROOM (انضمام جديد أو إعادة اتصال)
         // ====================================
-        socket.on('joinRoom', (data = {}) => {
+        socket.on('joinRoom', (data) => {
             if (!allowEvent(socket)) return;
+            data = normalizeData(data);
             try {
                 const room = getRoom(typeof data.roomCode === 'string' ? data.roomCode : null);
 
@@ -446,6 +282,12 @@ const handleSocketConnections = (io) => {
                 touch(room);
 
                 const userId = sanitizeUserId(data.userId);
+
+                // مطرود سابقاً من هذه الغرفة (بنفس الهوية أو نفس عنوان الشبكة) — الطرد نهائي
+                if (room.bannedUserIds.has(userId) || (socket.clientIp && room.bannedIps.has(socket.clientIp))) {
+                    socket.emit('roomError', 'أُخرجت من هذه الغرفة ولا يمكنك الانضمام إليها مرة أخرى.');
+                    return;
+                }
 
                 // إعادة اتصال: نفس الهوية موجودة في الغرفة → استعادة المقعد والحالة
                 const existing = room.players.find(p => p.userId === userId);
@@ -601,8 +443,11 @@ const handleSocketConnections = (io) => {
                 socket.emit('gameError', 'اللاعب غير موجود.');
                 return;
             }
+            // الطرد نهائي: لا يعود بنفس الهوية ولا من نفس عنوان الشبكة (وإلا فالطرد بلا أثر)
+            room.bannedUserIds.add(target.userId);
             const targetSocket = io.sockets.sockets.get(target.id);
             if (targetSocket) {
+                if (targetSocket.clientIp) room.bannedIps.add(targetSocket.clientIp);
                 targetSocket.emit('kicked', 'أخرجك المضيف من الغرفة.');
                 targetSocket.leave(room.code);
                 targetSocket.roomCode = null;
@@ -889,17 +734,6 @@ const handleSocketConnections = (io) => {
         });
     });
 };
-
-// تنظيف دوري للغرف الخاملة حسب آخر نشاط (لا عمر الغرفة) — غرف الانتظار
-// المهجورة تُحذف أسرع من غرفة فيها لعبة طويلة نشطة
-const cleanupTimer = setInterval(() => {
-    const now = Date.now();
-    Object.values(activeRooms).forEach(room => {
-        const limit = room.gameState === 'WAITING' ? WAITING_IDLE_TIMEOUT : ROOM_IDLE_TIMEOUT;
-        if (now - room.lastActivity > limit) deleteRoom(room, 'idle');
-    });
-}, 60 * 1000);
-cleanupTimer.unref();
 
 module.exports = handleSocketConnections;
 module.exports.constants = {

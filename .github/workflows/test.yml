@@ -9,7 +9,16 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # ملاحظة: بلا fetch-depth كامل عمداً — تاريخ هذا المستودع يحمل سراً قديماً
+      # مسرَّباً (.env في commits ما قبل 9b2ee99، موثّق في SECURITY.md) لم يُمحَ من
+      # التاريخ بعد. فحص السجل الكامل هنا يُبقي CI أحمر دائماً بلا فائدة إضافية؛
+      # هذا الفحص يغطي كل ارتكاب جديد من الآن فصاعداً، وهو ما يمنع تكرار الحادثة.
       - uses: actions/checkout@v4
+
+      - name: Secret scan (gitleaks) — الالتزامات الجديدة فقط
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-node@v4
         with:

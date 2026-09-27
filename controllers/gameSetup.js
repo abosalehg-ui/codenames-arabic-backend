@@ -1,13 +1,31 @@
 // تحميل قائمة الكلمات من الملف
 const wordsData = require('../words.json');
+const { normalizeArabic } = require('../utils/wordNormalizer');
 
-// دمج كل التصنيفات في قائمة واحدة مع إزالة أي تكرار (ضمانة إضافية
-// فوق تنظيف words.json نفسه — الكلمة المكررة تعني بطاقتين متطابقتين على اللوحة)
-const ALL_WORDS = [...new Set(Object.values(wordsData).flat())];
+// دمج كل التصنيفات في قائمة واحدة مع إزالة أي تكرار (ضمانة إضافية فوق تنظيف
+// words.json نفسه — الكلمة المكررة تعني بطاقتين متطابقتين على اللوحة). المقارنة
+// بعد التطبيع العربي لا بالنص الخام: "أخطبوط" و"اخطبوط" نص مختلف لكنهما نفس
+// الكلمة، ولو بقيتا معاً في القاموس فقد تظهران على لوحة واحدة بلونين مختلفين.
+const rawWords = Object.values(wordsData).flat();
+const seenNormalized = new Map();
+const duplicates = [];
+const ALL_WORDS = rawWords.filter(word => {
+    const key = normalizeArabic(word);
+    if (seenNormalized.has(key)) {
+        duplicates.push([seenNormalized.get(key), word]);
+        return false;
+    }
+    seenNormalized.set(key, word);
+    return true;
+});
+
+if (duplicates.length > 0) {
+    const list = duplicates.map(([a, b]) => `"${a}" / "${b}"`).join('، ');
+    throw new Error(`words.json يحتوي كلمات مكررة بعد التطبيع العربي: ${list} — احذف إحدى كل زوج.`);
+}
 
 // الكلمات المركّبة في القاموس ("أسد البحر") تُعدّ كلمة واحدة — تُستثنى من قاعدة
 // "التلميح كلمة واحدة" عند مقارنتها بصيغتها الموحّدة
-const { normalizeArabic } = require('../utils/wordNormalizer');
 const COMPOUND_WORDS = new Set(ALL_WORDS.filter(w => /\s/.test(w)).map(normalizeArabic));
 
 if (ALL_WORDS.length < 25) {

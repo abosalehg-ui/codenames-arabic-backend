@@ -1,3 +1,8 @@
+// هيكل مستقبلي غير مستخدم حالياً — لا تستدعيه الواجهة إطلاقاً، ويبقى معطّلاً
+// افتراضياً خلف ENABLE_AUTH_API (انظر server.js). إن فُعّل: يوجد توكن JWT صالح
+// بعد تسجيل الدخول، لكن لا يوجد أي مسار في هذا المستودع يتحقق من ذاك التوكن
+// أو يحمي به شيئاً — التفعيل وحده لا يحمي أي مورد، ويحتاج middleware تحقق
+// (jsonwebtoken.verify على رأس Authorization) قبل أن يصبح مفيداً فعلياً.
 const express = require('express');
 const { registerUser, loginUser } = require('../controllers/authController');
 const rateLimit = require('../utils/rateLimit');
