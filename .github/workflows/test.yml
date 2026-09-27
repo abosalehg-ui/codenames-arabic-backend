@@ -9,7 +9,22 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 مطلوب هنا لسبب تقني بحت، لا لفحص التاريخ كله: gitleaks
+      # في حدث pull_request يحسب مدى commit واحد بالضبط (الأصل^..الرأس لكل
+      # commit في الـ PR)، لكنه يحتاج ذلك الـ commit وأصله ككائنَي git حقيقيَّين
+      # محليَّين ليحسب الفرق بينهما — بعمق 1 (الافتراضي) لا يُجلَب حتى commit
+      # الفرع نفسه (فقط commit الدمج المصطنع لـ pull/N/merge)، فيفشل بخطأ
+      # "unknown revision". المدى المفحوص يبقى محصوراً بـ commits هذا الـ PR
+      # فقط مهما كان العمق المتاح محلياً — لا علاقة له بالسر القديم في
+      # SECURITY.md (ذاك يحتاج حذفاً من التاريخ فعلياً، لا مجرد سطر هنا)
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Secret scan (gitleaks) — الالتزامات الجديدة فقط
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-node@v4
         with:

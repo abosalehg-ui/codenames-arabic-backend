@@ -221,14 +221,19 @@ const main = async () => {
         ok('إنهاء الدور يدوياً');
 
         // إعادة الاتصال أثناء اللعبة بنفس userId
+        // الاستماع لكلا الحدثين يجب أن يُسجَّل قبل الإرسال: الخادم يبثّ roomJoined
+        // ثم gameStarted للـ socket نفسه بشكل متزامن، وقد يصلان معاً فيُفقد الحدث
+        // الثاني لو سُجِّل مستمعه بعد انتظار الأول (سباق حقيقي لاحظناه في التشغيل الفعلي)
         const guessAId = teamA === 'RED' ? ids.c2 : ids.c4;
         guessA.disconnect();
         await sleep(300);
         const guessA2 = await connect();
+        const rejoinP = once(guessA2, 'roomJoined');
+        const gReP = once(guessA2, 'gameStarted');
         guessA2.emit('joinRoom', { roomCode: ROOM, username: 'عائد', userId: guessAId });
-        const rejoin = await once(guessA2, 'roomJoined');
+        const rejoin = await rejoinP;
         if (rejoin.gameState !== 'IN_PROGRESS') fail('حالة اللعبة غير صحيحة بعد إعادة الاتصال');
-        const gRe = await once(guessA2, 'gameStarted');
+        const gRe = await gReP;
         assertSanitized(gRe.board, 'المخمن العائد');
         ok('إعادة الاتصال أثناء اللعبة استعادت المقعد والحالة');
 
@@ -250,12 +255,15 @@ const main = async () => {
         ok('القاتل أنهى اللعبة لصالح الخصم وكُشفت اللوحة + عدّاد الجولات 1-0');
 
         // إعادة اتصال بعد النهاية → يستلم الحالة FINISHED مع الفائز (لا يُرمى لغرفة الانتظار)
+        // (نفس ملاحظة السباق أعلاه: المستمعان يُسجَّلان قبل الإرسال)
         c3.disconnect();
         await sleep(200);
         const c3b = await connect();
+        const finJoinP = once(c3b, 'roomJoined');
+        const finStateP = once(c3b, 'gameStarted');
         c3b.emit('joinRoom', { roomCode: ROOM, username: 'سارة', userId: ids.c3 });
-        const finJoin = await once(c3b, 'roomJoined');
-        const finState = await once(c3b, 'gameStarted');
+        const finJoin = await finJoinP;
+        const finState = await finStateP;
         if (finJoin.gameState !== 'FINISHED' || finState.gameState !== 'FINISHED' || finState.winner !== teamB) fail('إعادة الاتصال بعد النهاية لم تُرجع حالة FINISHED مع الفائز');
         ok('إعادة الاتصال بعد النهاية تُرجع شاشة النتيجة');
 
@@ -390,6 +398,15 @@ const main = async () => {
         K.h.emit('kickPlayer', { playerId: kickedId });
         await kickedP; await leftK;
         ok('المضيف طرد لاعباً (المطرود أُعلم، والباقون استلموا playerLeft)، وغير المضيف مُنع');
+
+        // المطرود لا يعود بنفس الهوية (الطرد نهائي لا مجرد إزالة مؤقتة)
+        const rejoinAttempt = await connect();
+        rejoinAttempt.emit('joinRoom', { roomCode: 'KICKME', username: 'G2', userId: 'k-g2' });
+        const rejoinErr = await once(rejoinAttempt, 'roomError');
+        if (!rejoinErr.includes('أُخرجت')) fail('المطرود استطاع الانضمام مجدداً بنفس الهوية');
+        ok('المطرود لا يعود بنفس الهوية بعد الطرد');
+        rejoinAttempt.disconnect();
+
         [K.h, K.g1, K.s2, K.g2].forEach(c => c.disconnect());
         await sleep(200);
 
@@ -431,9 +448,12 @@ const main = async () => {
         const xStart = once(X, 'gameStarted'); S.h.emit('startGame'); const xGame = await xStart;
         assertSanitized(xGame.board, 'المتفرج');
         X.emit('setRole', { team: 'RED', role: 'SPYMASTER' }); await once(X, 'roleError');
+        // roomUpdate (بثّ للغرفة) وgameStarted (للـ socket نفسه) يصلان لـ X معاً؛
+        // مستمع gameStarted يُسجَّل قبل الإرسال لنفس سبب السباق الموثّق أعلاه
         const xJoin = once(S.h, 'roomUpdate', ps => ps.some(p => p.username === 'X' && p.team === 'RED' && p.role === 'GUESSER'));
+        const xGameStartedP = once(X, 'gameStarted');
         X.emit('setRole', { team: 'RED', role: 'GUESSER' });
-        await xJoin; await once(X, 'gameStarted');
+        await xJoin; await xGameStartedP;
         ok('المتفرج انضم مخمّناً أثناء اللعبة (ومُنع من القيادة)');
         [S.h, S.g1, S.s2, S.g2, X].forEach(c => c.disconnect());
 
